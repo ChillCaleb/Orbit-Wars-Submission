@@ -1,0 +1,8 @@
+.venv/
+.venv312/
+.uv-python/
+.uv-cache/
+.matplotlib/
+MP4/*.mp4
+__pycache__/
+*.pyc

@@ -1,0 +1,7 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv312/bin/python",
+  "python.terminal.activateEnvironment": true,
+  "terminal.integrated.env.osx": {
+    "MPLCONFIGDIR": "${workspaceFolder}/.matplotlib"
+  }
+}
