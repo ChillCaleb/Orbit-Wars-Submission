@@ -3,6 +3,11 @@
 .uv-python/
 .uv-cache/
 .matplotlib/
+LAB/
+TRAINING_RUNS/
+model_weights.npz
+submission.zip
+kaggle-submit.zip
 MP4/*.mp4
 __pycache__/
 *.pyc

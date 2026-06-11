@@ -1,7 +1,9 @@
 import argparse
+import importlib.util
 import math
 from pathlib import Path
 import re
+import sys
 import webbrowser
 
 import imageio.v2 as imageio
@@ -9,10 +11,21 @@ from kaggle_environments import make
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from main import agent
 
+ROOT = Path(__file__).resolve().parent
+VIDEO_DIR = ROOT / "MP4"
 
-VIDEO_DIR = Path("MP4")
+BUILTIN_AGENTS = {"random", "starter"}
+LOCAL_AGENT_ALIASES = {
+    "mine": "main.py",
+    "main": "main.py",
+    "smith": "agent_smith.py",
+    "agent_smith": "agent_smith.py",
+    "1039": "agent_1039_launch_safety.py",
+    "safety": "agent_1039_launch_safety.py",
+    "1200": "agent_1200_ppo_strategy.py",
+    "ppo": "agent_1200_ppo_strategy.py",
+}
 
 COLORS = {
     -1: "#888888",
@@ -23,14 +36,83 @@ COLORS = {
 }
 
 
-def run_one(opponent):
+def load_agent_file(path, slot):
+    module_name = f"_orbit_agent_{slot}_{re.sub(r'[^a-zA-Z0-9_]', '_', path.stem)}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load agent file: {path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+
+    loaded_agent = getattr(module, "agent", None)
+    if loaded_agent is None:
+        raise AttributeError(f"{path} does not define an agent(obs, config=None) function")
+    return loaded_agent
+
+
+def resolve_local_agent_path(agent_spec):
+    alias = LOCAL_AGENT_ALIASES.get(agent_spec.lower())
+    raw_path = Path(alias if alias is not None else agent_spec).expanduser()
+    if not raw_path.is_absolute():
+        raw_path = ROOT / raw_path
+    return raw_path
+
+
+def load_agent(agent_spec, slot):
+    normalized = agent_spec.lower()
+    if normalized in BUILTIN_AGENTS:
+        return normalized, normalized
+
+    if normalized in LOCAL_AGENT_ALIASES:
+        path = resolve_local_agent_path(agent_spec)
+        if not path.exists():
+            raise FileNotFoundError(f"Agent file not found: {path}")
+        return load_agent_file(path, slot), normalized
+
+    path = resolve_local_agent_path(agent_spec)
+    if path.exists() or path.suffix == ".py":
+        if not path.exists():
+            raise FileNotFoundError(f"Agent file not found: {path}")
+        return load_agent_file(path, slot), path.stem
+
+    return agent_spec, agent_spec
+
+
+def build_lineup(agent_specs):
+    if len(agent_specs) not in (2, 4):
+        raise ValueError("--players must contain exactly 2 or 4 agents")
+    agents = []
+    labels = []
+    for slot, agent_spec in enumerate(agent_specs):
+        loaded_agent, label = load_agent(agent_spec, slot)
+        agents.append(loaded_agent)
+        labels.append(label)
+    return agents, labels
+
+
+def run_one(agents):
     env = make("orbit_wars", debug=True)
-    env.run([agent, opponent])
+    env.run(agents)
     return env
 
 
-def summarize(final_step):
-    return [(idx, state.reward, state.status) for idx, state in enumerate(final_step)]
+def summarize(final_step, labels):
+    return [
+        (idx, labels[idx] if idx < len(labels) else f"player {idx}", state.reward, state.status)
+        for idx, state in enumerate(final_step)
+    ]
+
+
+def winners(final_step):
+    rewards = [state.reward for state in final_step]
+    best_reward = max(rewards)
+    return [idx for idx, reward in enumerate(rewards) if reward == best_reward]
 
 
 def font(size):
@@ -162,7 +244,16 @@ def save_video(env, path, size, fps, frame_step):
 def main():
     parser = argparse.ArgumentParser(description="Run the Orbit Wars bot locally.")
     parser.add_argument("--games", type=int, default=1, help="Number of games to run.")
-    parser.add_argument("--opponent", default="random", help="Opponent agent name or file.")
+    parser.add_argument(
+        "--players",
+        nargs="+",
+        help="Explicit 2- or 4-player lineup. Use mine, random, starter, aliases, or .py files.",
+    )
+    parser.add_argument(
+        "--opponent",
+        default=None,
+        help="Backward-compatible shortcut for mine vs this opponent.",
+    )
     parser.add_argument("--save-all", action="store_true", help="Save every replay when --games is above 1.")
     parser.add_argument("--no-save", action="store_true", help="Do not save an MP4 replay.")
     parser.add_argument("--open", action="store_true", help="Compatibility option; videos open by default.")
@@ -172,21 +263,32 @@ def main():
     parser.add_argument("--frame-step", type=int, default=1, help="Save every Nth environment step as a frame.")
     args = parser.parse_args()
 
-    wins = losses = ties = 0
+    if args.players and args.opponent is not None:
+        parser.error("Use either --players or --opponent, not both.")
+
+    agent_specs = args.players if args.players else ["mine", args.opponent or "random"]
+    try:
+        agents, labels = build_lineup(agent_specs)
+    except (AttributeError, FileNotFoundError, RuntimeError, ValueError) as exc:
+        parser.error(str(exc))
+
+    win_counts = [0] * len(labels)
+    tie_games = 0
     saved_paths = []
     args._saved_paths = saved_paths
     first_number = next_replay_number(VIDEO_DIR)
+    lineup = ", ".join(f"P{idx}: {label}" for idx, label in enumerate(labels))
+    print(f"Lineup: {lineup}")
 
     for game_idx in range(args.games):
-        env = run_one(args.opponent)
-        player_reward = env.steps[-1][0].reward
-        if player_reward > 0:
-            wins += 1
-        elif player_reward < 0:
-            losses += 1
+        env = run_one(agents)
+        game_winners = winners(env.steps[-1])
+        if len(game_winners) == 1:
+            win_counts[game_winners[0]] += 1
         else:
-            ties += 1
-        print(f"Game {game_idx + 1}: {summarize(env.steps[-1])}")
+            tie_games += 1
+        winner_label = ", ".join(f"P{idx} {labels[idx]}" for idx in game_winners)
+        print(f"Game {game_idx + 1}: {summarize(env.steps[-1], labels)} Winner: {winner_label}")
 
         should_save_this = not args.no_save and (args.save_all or game_idx == args.games - 1)
         if should_save_this:
@@ -194,7 +296,8 @@ def main():
             saved_paths.append(saved_path)
             print(f"Video saved to: {saved_path}")
 
-    print(f"Record: {wins}-{losses}-{ties} over {args.games} game(s)")
+    record = ", ".join(f"P{idx} {labels[idx]}: {wins}" for idx, wins in enumerate(win_counts))
+    print(f"Wins: {record}; ties: {tie_games} over {args.games} game(s)")
 
     if saved_paths and not args.no_open:
         webbrowser.open(saved_paths[-1].as_uri())

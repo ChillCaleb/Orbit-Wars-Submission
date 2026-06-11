@@ -1,5 +1,26 @@
 import math
 from collections import namedtuple
+from pathlib import Path
+
+try:
+    import numpy as np
+except Exception:
+    np = None
+
+try:
+    from tactical_features import (
+        action_feature_vector_for_state as _tf_action_feature_vector_for_state,
+        action_penalty_profile_for_state as _tf_action_penalty_profile_for_state,
+        infer_role_assignments_from_state as _tf_infer_roles,
+        numeric_quadrant_array as _tf_numeric_quadrant_array,
+        role_scores as _tf_role_scores,
+    )
+except Exception:
+    _tf_action_feature_vector_for_state = None
+    _tf_action_penalty_profile_for_state = None
+    _tf_infer_roles = None
+    _tf_numeric_quadrant_array = None
+    _tf_role_scores = None
 
 try:
     from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet, Planet
@@ -11,11 +32,12 @@ try:
     from kaggle_environments.envs.orbit_wars.orbit_wars import CENTER, ROTATION_RADIUS_LIMIT
 except Exception:
     CENTER = (50.0, 50.0)
-    ROTATION_RADIUS_LIMIT = 30.0
+    ROTATION_RADIUS_LIMIT = 50.0
 
 
 NEUTRAL = -1
 BOARD_SIZE = 100.0
+SHIP_SPEED_MAX = 6.0
 CORNERS = ((0.0, 0.0), (0.0, BOARD_SIZE), (BOARD_SIZE, 0.0), (BOARD_SIZE, BOARD_SIZE))
 QUADRANT_CORNERS = {
     0: (BOARD_SIZE, BOARD_SIZE),
@@ -24,8 +46,55 @@ QUADRANT_CORNERS = {
     3: (BOARD_SIZE, 0.0),
 }
 CORNER_CLUSTER_RADIUS = 45.0
-SUN_DANGER_RADIUS = 5.0
+SUN_RADIUS = 10.0
+SUN_DANGER_RADIUS = SUN_RADIUS + 1.0
+FLEET_SPAWN_CLEARANCE = 0.2
+OPENING_STALL_SHIPS = 20
+SMALL_ATTACK_READY_SHIPS = 20
+BIG_ATTACK_READY_SHIPS = 40
+EASY_TARGET_SHIPS = 10
+TOTAL_STEPS = 500.0
+TACTICAL_FEATURE_SCALES = (
+    1200.0,
+    100.0,
+    4.0,
+    8.0,
+    1200.0,
+    1200.0,
+    1.0,
+    1800.0,
+    120.0,
+    1800.0,
+    4.0,
+    1800.0,
+    160.0,
+    8.0,
+    16.0,
+    1800.0,
+)
+TACTICAL_MODEL_TOP_K = 10
+ATTACK_SUPPORT_RADIUS = 18.0
+ATTACK_LONG_RANGE_RADIUS = 26.0
+ATTACK_MIN_FRONTLINE_SHIPS = 24
+ESTABLISHED_STATIC_ASSAULT_RADIUS = 24.0
+ANCHOR_SMALL_HOLD_SHIPS = 18
+ANCHOR_SMALL_PRESSURED_HOLD_SHIPS = 24
+PRE_ESTABLISHMENT_BURST_MAX_NEED = 12
+PRE_ESTABLISHMENT_TRAP_MAX_ETA = 7.0
+PRE_ESTABLISHMENT_TRAP_SPARE_SHIPS = 4
+ATTACKER_STAGE_TARGET_SHIPS = 32
+ATTACKER_STAGE_IN_QUADRANT_SHIPS = 44
+ATTACKER_STAGE_MIN_FEED = 16
+ATTACKER_STAGE_BIG_FEED = 24
+PlanetProfile = namedtuple("PlanetProfile", "planet labels quadrant angle distance_to_center corner_distance")
+AttackMeasurement = namedtuple(
+    "AttackMeasurement",
+    "angle target_x target_y eta speed launch_x launch_y sun_distance blocker_id clear",
+)
 _STATE = {}
+_TACTICAL_MODEL = None
+_TACTICAL_MODEL_ATTEMPTED = False
+ROOT = Path(__file__).resolve().parent if "__file__" in globals() else Path(".")
 
 
 def _obs_get(obs, name, default=None):
@@ -79,6 +148,10 @@ def _is_static(p):
     return _distance_to_center(p) + float(p.radius) >= float(ROTATION_RADIUS_LIMIT)
 
 
+def _is_orbiting(p):
+    return not _is_static(p)
+
+
 def _is_big(p):
     production = int(p.production)
     if production >= 5:
@@ -86,6 +159,10 @@ def _is_big(p):
     if _is_static(p):
         return production >= 2
     return production >= 3
+
+
+def _is_large_production(p):
+    return int(p.production) >= 5
 
 
 def _planet_angle(p):
@@ -100,6 +177,19 @@ def _angle_quadrant(angle):
 
 def _quadrant(p):
     return _angle_quadrant(_planet_angle(p))
+
+
+def _equator_side(p):
+    _, cy = _center_xy()
+    return 1 if float(p.y) >= cy else -1
+
+
+def _same_equator_side(a, b):
+    return _equator_side(a) == _equator_side(b)
+
+
+def _same_equator_targets(source, candidates):
+    return [p for p in candidates if _same_equator_side(source, p)]
 
 
 def _ahead_quadrant(quadrant, angular_velocity):
@@ -168,23 +258,58 @@ def _angle_to_xy(source, tx, ty):
     return math.atan2(float(ty) - float(source.y), float(tx) - float(source.x))
 
 
+def _angle_from_xy(ax, ay, bx, by):
+    return math.atan2(float(by) - float(ay), float(bx) - float(ax))
+
+
 def _norm_angle(angle):
     return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def _fleet_speed(ships):
-    return max(1.0, min(6.0, math.sqrt(max(1.0, float(ships)))))
+    ships = max(1.0, float(ships))
+    if ships <= 1.0:
+        return 1.0
+    scale = max(0.0, min(1.0, math.log(ships) / math.log(1000.0)))
+    return max(1.0, min(SHIP_SPEED_MAX, 1.0 + (SHIP_SPEED_MAX - 1.0) * (scale ** 1.5)))
 
 
 def _available(source, reserved):
     return max(0, int(source.ships) - reserved.get(source.id, 0))
 
 
+def _attack_ready_ships(source):
+    return BIG_ATTACK_READY_SHIPS if _is_big(source) else SMALL_ATTACK_READY_SHIPS
+
+
+def _post_init_attack_ready(source, reserved):
+    return _available(source, reserved) >= _attack_ready_ships(source)
+
+
+def _source_can_attempt_capture(source, reserved):
+    if _is_large_production(source):
+        return _available(source, reserved) > 0
+    return _post_init_attack_ready(source, reserved)
+
+
+def _capture_ready_for_need(source, reserved, need):
+    if _is_large_production(source):
+        return _available(source, reserved) >= int(need)
+    return _post_init_attack_ready(source, reserved)
+
+
+def _expansion_ready_for_need(source, reserved, need):
+    return _available(source, reserved) >= int(need)
+
+
 def _add_move(moves, reserved, source, angle, ships):
     amount = min(max(0, int(ships)), _available(source, reserved))
     if amount <= 0:
         return 0
-    moves.append([source.id, _norm_angle(angle), amount])
+    safe_angle = _norm_angle(angle)
+    if not _angle_clear_of_sun(source, safe_angle):
+        return 0
+    moves.append([source.id, safe_angle, amount])
     reserved[source.id] = reserved.get(source.id, 0) + amount
     return amount
 
@@ -198,18 +323,228 @@ def _point_after_orbit(p, turns, angular_velocity):
     return cx + math.cos(theta) * radius, cy + math.sin(theta) * radius
 
 
-def _aim_at(source, target, ships, angular_velocity):
+def _launch_point(source, angle):
+    offset = float(source.radius) + FLEET_SPAWN_CLEARANCE
+    return (
+        float(source.x) + math.cos(float(angle)) * offset,
+        float(source.y) + math.sin(float(angle)) * offset,
+    )
+
+
+def _ray_board_exit_point(sx, sy, angle):
+    sx, sy = float(sx), float(sy)
+    dx, dy = math.cos(float(angle)), math.sin(float(angle))
+    distances = []
+    if dx > 1e-9:
+        distances.append((BOARD_SIZE - sx) / dx)
+    elif dx < -1e-9:
+        distances.append((0.0 - sx) / dx)
+    if dy > 1e-9:
+        distances.append((BOARD_SIZE - sy) / dy)
+    elif dy < -1e-9:
+        distances.append((0.0 - sy) / dy)
+    positive = [distance for distance in distances if distance >= 0.0]
+    if not positive:
+        return sx, sy
+    travel = min(positive)
+    return sx + dx * travel, sy + dy * travel
+
+
+def _aim_solution(source, target, ships, angular_velocity):
     speed = _fleet_speed(ships)
     tx, ty = float(target.x), float(target.y)
-    for _ in range(3):
-        travel = _distance_xy(float(source.x), float(source.y), tx, ty) / speed
+    angle = _angle_to_xy(source, tx, ty)
+    travel = 0.0
+    for _ in range(6):
+        lx, ly = _launch_point(source, angle)
+        travel_distance = max(0.0, _distance_xy(lx, ly, tx, ty) - float(target.radius))
+        travel = travel_distance / speed
         tx, ty = _point_after_orbit(target, travel, angular_velocity)
-    return _angle_to_xy(source, tx, ty), tx, ty
+        angle = _angle_to_xy(source, tx, ty)
+    lx, ly = _launch_point(source, angle)
+    travel_distance = max(0.0, _distance_xy(lx, ly, tx, ty) - float(target.radius))
+    travel = travel_distance / speed
+    return angle, tx, ty, travel, lx, ly
 
 
-def _segment_distance_to_center(source, tx, ty):
+def _segment_entry_distance_to_circle(sx, sy, tx, ty, cx, cy, radius):
+    sx, sy = float(sx), float(sy)
+    tx, ty = float(tx), float(ty)
+    cx, cy = float(cx), float(cy)
+    vx, vy = tx - sx, ty - sy
+    length_sq = vx * vx + vy * vy
+    if length_sq <= 0.0:
+        return None
+
+    length = math.sqrt(length_sq)
+    projection_distance = ((cx - sx) * vx + (cy - sy) * vy) / length
+    if projection_distance < 0.0 or projection_distance > length:
+        return None
+
+    closest_x = sx + (projection_distance / length) * vx
+    closest_y = sy + (projection_distance / length) * vy
+    miss = _distance_xy(closest_x, closest_y, cx, cy)
+    radius = float(radius)
+    if miss > radius:
+        return None
+
+    entry = projection_distance - math.sqrt(max(0.0, radius * radius - miss * miss))
+    if entry < 0.0:
+        entry = 0.0
+    if entry > length:
+        return None
+    return entry
+
+
+def _sun_entry_distance_on_segment(sx, sy, tx, ty):
     cx, cy = _center_xy()
-    sx, sy = float(source.x), float(source.y)
+    return _segment_entry_distance_to_circle(sx, sy, tx, ty, cx, cy, SUN_DANGER_RADIUS)
+
+
+def _angle_clear_of_sun(source, angle):
+    sx, sy = _launch_point(source, angle)
+    ex, ey = _ray_board_exit_point(sx, sy, angle)
+    return _sun_entry_distance_on_segment(sx, sy, ex, ey) is None
+
+
+def _ray_distance_to_center(source, angle):
+    sx, sy = _launch_point(source, angle)
+    ex, ey = _ray_board_exit_point(sx, sy, angle)
+    return _segment_distance_to_center_xy(sx, sy, ex, ey)
+
+
+def _first_planet_on_ray(source, angle, planets):
+    if not planets:
+        return None
+    sx, sy = _launch_point(source, angle)
+    return _first_planet_on_ray_from_point(sx, sy, angle, planets, excluded_ids={source.id})
+
+
+def _first_planet_on_ray_from_point(sx, sy, angle, planets, excluded_ids=None):
+    if not planets:
+        return None
+    excluded_ids = excluded_ids or set()
+    ex, ey = _ray_board_exit_point(sx, sy, angle)
+    closest = None
+    closest_planet = None
+    for planet in planets:
+        if planet.id in excluded_ids:
+            continue
+        entry = _segment_entry_distance_to_circle(
+            sx,
+            sy,
+            ex,
+            ey,
+            float(planet.x),
+            float(planet.y),
+            float(planet.radius) + 0.1,
+        )
+        if entry is None:
+            continue
+        if closest is None or entry < closest:
+            closest = entry
+            closest_planet = planet
+    return closest_planet
+
+
+def _projected_fleet_target_id(fleet, planets):
+    target = _first_planet_on_ray_from_point(
+        float(fleet.x),
+        float(fleet.y),
+        float(fleet.angle),
+        planets,
+        excluded_ids={int(fleet.from_planet_id)},
+    )
+    return target.id if target is not None else None
+
+
+def _incoming_friendly_ships_by_target(player, planets, fleets):
+    committed = {}
+    for fleet in fleets or []:
+        if int(fleet.owner) != int(player):
+            continue
+        target_id = _projected_fleet_target_id(fleet, planets)
+        if target_id is None:
+            continue
+        committed[target_id] = committed.get(target_id, 0) + int(fleet.ships)
+    return committed
+
+
+def _claimed_capture_threshold(target):
+    threshold = int(target.ships) + 1
+    if int(target.owner) != NEUTRAL:
+        threshold += int(target.production) + (2 if _is_static(target) else 1)
+    elif _is_big(target):
+        threshold += 1
+    return threshold
+
+
+def _claimed_target_ids(state, player, planets, fleets=None):
+    claimed = {int(burst["target_id"]) for burst in state.get("bursts", [])}
+    claimed.update(int(target_id) for target_id in state.get("turn_claimed_target_ids", set()))
+    incoming = _incoming_friendly_ships_by_target(player, planets, fleets or [])
+    for target in planets:
+        if int(target.owner) == int(player):
+            continue
+        if incoming.get(int(target.id), 0) >= _claimed_capture_threshold(target):
+            claimed.add(int(target.id))
+    return claimed
+
+
+def _first_planet_blocker(source, target, lx, ly, tx, ty, eta, planets, angular_velocity):
+    if not planets:
+        return None
+
+    target_entry = max(0.0, _distance_xy(lx, ly, tx, ty) - float(target.radius))
+    closest_entry = None
+    closest_id = None
+    for planet in planets:
+        if planet.id in (source.id, target.id):
+            continue
+        px, py = _point_after_orbit(planet, eta, angular_velocity)
+        entry = _segment_entry_distance_to_circle(
+            lx,
+            ly,
+            tx,
+            ty,
+            px,
+            py,
+            float(planet.radius) + 0.1,
+        )
+        if entry is None or entry >= target_entry - 0.05:
+            continue
+        if closest_entry is None or entry < closest_entry:
+            closest_entry = entry
+            closest_id = planet.id
+    return closest_id
+
+
+def _attack_measurement(source, target, ships, angular_velocity, planets=None):
+    angle, tx, ty, eta, lx, ly = _aim_solution(source, target, ships, angular_velocity)
+    sun_distance = _ray_distance_to_center(source, angle)
+    blocker_id = _first_planet_blocker(source, target, lx, ly, tx, ty, eta, planets, angular_velocity)
+    return AttackMeasurement(
+        angle=angle,
+        target_x=tx,
+        target_y=ty,
+        eta=eta,
+        speed=_fleet_speed(ships),
+        launch_x=lx,
+        launch_y=ly,
+        sun_distance=sun_distance,
+        blocker_id=blocker_id,
+        clear=_angle_clear_of_sun(source, angle) and blocker_id is None,
+    )
+
+
+def _aim_at(source, target, ships, angular_velocity):
+    measurement = _attack_measurement(source, target, ships, angular_velocity)
+    return measurement.angle, measurement.target_x, measurement.target_y
+
+
+def _segment_distance_to_center_xy(sx, sy, tx, ty):
+    cx, cy = _center_xy()
+    sx, sy = float(sx), float(sy)
     vx, vy = float(tx) - sx, float(ty) - sy
     length_sq = vx * vx + vy * vy
     if length_sq == 0.0:
@@ -219,45 +554,722 @@ def _segment_distance_to_center(source, tx, ty):
     return _distance_xy(px, py, cx, cy)
 
 
-def _clear_of_sun(source, tx, ty):
-    return _segment_distance_to_center(source, tx, ty) > SUN_DANGER_RADIUS
+def _segment_distance_to_center(source, tx, ty, angle=None):
+    if angle is None:
+        sx, sy = float(source.x), float(source.y)
+    else:
+        sx, sy = _launch_point(source, angle)
+    return _segment_distance_to_center_xy(sx, sy, tx, ty)
+
+
+def _clear_of_sun(source, tx, ty, angle=None):
+    if angle is not None:
+        return _angle_clear_of_sun(source, angle)
+    return _segment_distance_to_center(source, tx, ty, angle=angle) > SUN_DANGER_RADIUS
 
 
 def _capture_need(source, target, angular_velocity, base=None):
+    if _is_large_production(source):
+        return max(1, int(target.ships) + 1)
     if base is None:
         base = int(target.ships) + 1
-    speed = _fleet_speed(base)
-    eta = _distance(source, target) / speed
+    eta = _attack_measurement(source, target, base, angular_velocity).eta
     production_buffer = 0 if int(target.owner) == NEUTRAL else int(math.ceil(float(target.production) * eta))
     return max(1, int(target.ships) + production_buffer + 1)
+
+
+def _planned_capture_need(source, target, angular_velocity, safety=2):
+    return max(1, int(target.ships) + 1)
+
+
+def _local_support_totals(player, target, planets, fleets=None, radius=ATTACK_SUPPORT_RADIUS):
+    friendly = 0
+    enemy = 0
+    for planet in planets:
+        if planet.id == target.id:
+            continue
+        if _distance(planet, target) > radius:
+            continue
+        weight = int(planet.ships) + 2 * int(planet.production)
+        if int(planet.owner) == player:
+            friendly += weight
+        elif int(planet.owner) not in (player, NEUTRAL):
+            enemy += weight
+
+    for fleet in fleets or []:
+        if _distance_xy(float(fleet.x), float(fleet.y), float(target.x), float(target.y)) > radius:
+            continue
+        if int(fleet.owner) == player:
+            friendly += int(fleet.ships)
+        elif int(fleet.owner) >= 0 and int(fleet.owner) != player:
+            enemy += int(fleet.ships)
+
+    return friendly, enemy
+
+
+def _quadrant_totals(player, quadrant, planets, fleets=None):
+    ours = 0
+    enemy = 0
+    for planet in planets:
+        if _quadrant(planet) != quadrant:
+            continue
+        weight = int(planet.ships) + 3 * int(planet.production)
+        if int(planet.owner) == player:
+            ours += weight
+        elif int(planet.owner) not in (player, NEUTRAL):
+            enemy += weight
+
+    for fleet in fleets or []:
+        if _angle_quadrant(math.atan2(float(fleet.y) - _center_xy()[1], float(fleet.x) - _center_xy()[0])) != quadrant:
+            continue
+        if int(fleet.owner) == player:
+            ours += int(fleet.ships)
+        elif int(fleet.owner) >= 0 and int(fleet.owner) != player:
+            enemy += int(fleet.ships)
+
+    return ours, enemy
+
+
+def _quadrant_control_margin(player, quadrant, planets, fleets=None):
+    ours, enemy = _quadrant_totals(player, quadrant, planets, fleets=fleets)
+    return ours - enemy
+
+
+def _adjacent_quadrants(quadrant):
+    quadrant = int(quadrant)
+    return ((quadrant - 1) % 4, (quadrant + 1) % 4)
+
+
+def _half_control_margin(player, quadrants, planets, fleets=None):
+    return sum(_quadrant_control_margin(player, quadrant, planets, fleets=fleets) for quadrant in quadrants)
+
+
+def _offensive_capture_need(source, target, player, planets, fleets, angular_velocity):
+    base = _capture_need(source, target, angular_velocity)
+    friendly_support, enemy_support = _local_support_totals(player, target, planets, fleets=fleets)
+    support_pressure = max(0, enemy_support - friendly_support)
+    support_buffer = min(18, int(math.ceil(support_pressure / 6.0)))
+    static_buffer = 2 if _is_static(target) and int(target.owner) != NEUTRAL else 0
+    big_buffer = 2 if _is_big(target) and int(target.owner) != NEUTRAL else 0
+    return base + support_buffer + static_buffer + big_buffer
+
+
+def _small_node_hold_level(player, target, planets):
+    friendly_support, enemy_support = _local_support_totals(player, target, planets, radius=ATTACK_SUPPORT_RADIUS)
+    support_gap = enemy_support - friendly_support
+    if support_gap > 0:
+        return ANCHOR_SMALL_PRESSURED_HOLD_SHIPS + min(8, int(math.ceil(support_gap / 10.0)))
+
+    local_enemy_static = any(
+        int(planet.owner) not in (player, NEUTRAL)
+        and _is_static(planet)
+        and _quadrant(planet) == _quadrant(target)
+        and _distance(planet, target) <= ESTABLISHED_STATIC_ASSAULT_RADIUS
+        for planet in planets
+    )
+    if local_enemy_static:
+        return ANCHOR_SMALL_PRESSURED_HOLD_SHIPS
+    return ANCHOR_SMALL_HOLD_SHIPS
+
+
+def _is_easy_target(p):
+    return int(p.ships) <= EASY_TARGET_SHIPS
+
+
+def _planet_labels(p, player=None, planets=None):
+    quadrant = _quadrant(p)
+    labels = []
+    if player is not None:
+        if int(p.owner) == player:
+            labels.append("ours")
+        elif int(p.owner) == NEUTRAL:
+            labels.append("neutral")
+        else:
+            labels.append("enemy")
+    elif int(p.owner) == NEUTRAL:
+        labels.append("neutral")
+    else:
+        labels.append("owned")
+
+    labels.append("orbiting" if _is_orbiting(p) else "static")
+    labels.append("big" if _is_big(p) else "small")
+    labels.append("easy" if _is_easy_target(p) else "held")
+    labels.append("corner" if _is_corner_node(p) else "non-corner")
+    labels.append("q%d" % quadrant)
+
+    if planets is not None and _is_corner_node(p):
+        labels.append("corner-big" if _is_quadrant_big(p, planets, quadrant) else "corner-small")
+
+    return tuple(labels)
+
+
+def _planet_profile(p, player=None, planets=None):
+    quadrant = _quadrant(p)
+    return PlanetProfile(
+        planet=p,
+        labels=_planet_labels(p, player=player, planets=planets),
+        quadrant=quadrant,
+        angle=_planet_angle(p),
+        distance_to_center=_distance_to_center(p),
+        corner_distance=_distance_to_quadrant_corner(p, quadrant),
+    )
+
+
+def _smallest_target_key(source, target):
+    target_profile = _planet_profile(target)
+    return (
+        "easy" not in target_profile.labels,
+        int(target.owner) != NEUTRAL,
+        int(target.ships),
+        _distance(source, target),
+        -int(target.production),
+        -float(target.radius),
+        target_profile.corner_distance,
+    )
+
+
+def _easy_targets(source, player, planets, claimed_target_ids):
+    return sorted(
+        [
+            p
+            for p in planets
+            if int(p.owner) != player and p.id not in claimed_target_ids and _is_easy_target(p)
+        ],
+        key=lambda p: _smallest_target_key(source, p),
+    )
+
+
+def _prepend_unique_targets(preferred, candidates):
+    seen = set()
+    ordered = []
+    for target in list(preferred) + list(candidates):
+        if target is None or target.id in seen:
+            continue
+        seen.add(target.id)
+        ordered.append(target)
+    return ordered
+
+
+def _learning_focus_targets(state, player, planets, fleets, source, candidates):
+    if len(candidates) < 2:
+        return candidates
+
+    source_quadrant = _quadrant(source)
+    control_half = _current_control_half(state, player, planets, fleets=fleets)
+    attacker_target_quadrant = state.get("attacker_target_quadrant")
+    highlighted = []
+
+    def _add_group(group):
+        if not group:
+            return
+        ordered = sorted(group, key=lambda target: _smallest_target_key(source, target))
+        highlighted.extend(ordered[:2])
+        highlighted.extend([target for target in ordered if _is_static(target)][:2])
+        highlighted.extend([target for target in ordered if _is_orbiting(target)][:2])
+
+    same_quadrant = [target for target in candidates if _quadrant(target) == source_quadrant]
+    target_quadrant_group = (
+        [target for target in candidates if _quadrant(target) == int(attacker_target_quadrant)]
+        if attacker_target_quadrant is not None
+        else []
+    )
+    half_group = [target for target in candidates if control_half and _quadrant(target) in control_half]
+
+    for group in (target_quadrant_group, same_quadrant, half_group, candidates):
+        _add_group(group)
+
+    return _prepend_unique_targets(highlighted, candidates)
+
+
+def _empty_tactical_tendency():
+    return {
+        "launches": 0,
+        "ships_launched": 0,
+        "neutral_targets": 0,
+        "enemy_targets": 0,
+        "friendly_targets": 0,
+        "static_targets": 0,
+        "rotating_targets": 0,
+        "central_rotating_big": 0,
+        "central_rotating_small": 0,
+        "captures": 0,
+        "losses": 0,
+    }
+
+
+def _fresh_state():
+    return {
+        "bursts": [],
+        "turn_claimed_target_ids": set(),
+        "prime_quadrant": None,
+        "opened": False,
+        "opening_target_ids": [],
+        "opening_launched_ids": [],
+        "primary_anchor_id": None,
+        "attacker_planet_id": None,
+        "attacker_target_quadrant": None,
+        "static_collector_id": None,
+        "previous_owned_ids": None,
+        "previous_owner_by_planet": None,
+        "recent_static_capture_id": None,
+        "recent_static_capture_quadrant": None,
+        "tactical_tendency": _empty_tactical_tendency(),
+    }
+
+
+def _sigmoid(value):
+    value = max(-60.0, min(60.0, float(value)))
+    return 1.0 / (1.0 + math.exp(-value))
+
+
+def _load_tactical_model():
+    global _TACTICAL_MODEL, _TACTICAL_MODEL_ATTEMPTED
+    if _TACTICAL_MODEL_ATTEMPTED:
+        return _TACTICAL_MODEL
+
+    _TACTICAL_MODEL_ATTEMPTED = True
+    if np is None:
+        return None
+
+    candidates = [ROOT / "model_weights.npz"]
+    candidates.extend(sorted(ROOT.glob("TRAINING_RUNS/*/model_weights.npz"), reverse=True))
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            with np.load(path) as model:
+                weights = np.asarray(model["weights"], dtype=np.float32)
+                bias = float(np.asarray(model["bias"], dtype=np.float32).reshape(-1)[0])
+                mean = np.asarray(model["mean"], dtype=np.float32)
+                std = np.asarray(model["std"], dtype=np.float32)
+        except Exception:
+            continue
+        if weights.ndim != 1 or weights.shape[0] <= 0 or mean.shape != weights.shape or std.shape != weights.shape:
+            continue
+        std = std.copy()
+        std[std < 1e-6] = 1.0
+        _TACTICAL_MODEL = {
+            "path": str(path),
+            "weights": weights,
+            "bias": bias,
+            "mean": mean,
+            "std": std,
+        }
+        return _TACTICAL_MODEL
+    return None
+
+
+def _player_count(planets, fleets, player):
+    owners = [int(player)]
+    owners.extend(int(p.owner) for p in planets if int(p.owner) >= 0)
+    owners.extend(int(f.owner) for f in fleets if int(f.owner) >= 0)
+    return max(2, max(owners, default=0) + 1)
+
+
+def _planet_row(p):
+    return [int(p.id), int(p.owner), float(p.x), float(p.y), float(p.radius), int(p.ships), int(p.production)]
+
+
+def _fleet_row(f):
+    return [int(f.id), int(f.owner), float(f.x), float(f.y), float(f.angle), int(f.from_planet_id), int(f.ships)]
+
+
+def _tactical_obs(player, step, planets, fleets, angular_velocity):
+    return {
+        "player": int(player),
+        "step": int(step),
+        "angular_velocity": float(angular_velocity),
+        "planets": [_planet_row(p) for p in planets],
+        "fleets": [_fleet_row(f) for f in fleets],
+        "comet_planet_ids": [],
+    }
+
+
+def _fallback_numeric_quadrant_array(planets, fleets, player, player_count):
+    rows = []
+    established_by_owner = {owner: _operationally_established_quadrants(planets, owner) for owner in range(player_count)}
+    for quadrant in range(4):
+        our_ships = 0
+        our_production = 0
+        our_big_static = 0
+        our_small_static = 0
+        our_rotating_ships = 0
+        neutral_ships = 0
+        neutral_production = 0
+        neutral_big_static = 0
+        neutral_small_static = 0
+        neutral_rotating_ships = 0
+        enemy_ships = 0
+        enemy_production = 0
+        enemy_fleet_ships = 0
+        enemy_established = 0
+        our_fleet_ships = 0
+        our_established = 1 if quadrant in established_by_owner.get(int(player), set()) else 0
+
+        for owner in range(player_count):
+            if owner != int(player) and quadrant in established_by_owner.get(owner, set()):
+                enemy_established += 1
+
+        for planet in planets:
+            if _quadrant(planet) != quadrant:
+                continue
+            static = _is_static(planet)
+            big_static = static and int(planet.production) >= 5
+            small_static = static and not big_static
+            if int(planet.owner) == int(player):
+                our_ships += int(planet.ships)
+                our_production += int(planet.production)
+                if big_static:
+                    our_big_static += 1
+                if small_static:
+                    our_small_static += 1
+                if not static:
+                    our_rotating_ships += int(planet.ships)
+            elif int(planet.owner) == NEUTRAL:
+                neutral_ships += int(planet.ships)
+                neutral_production += int(planet.production)
+                if big_static:
+                    neutral_big_static += 1
+                if small_static:
+                    neutral_small_static += 1
+                if not static:
+                    neutral_rotating_ships += int(planet.ships)
+            else:
+                enemy_ships += int(planet.ships)
+                enemy_production += int(planet.production)
+
+        for fleet in fleets:
+            fleet_quadrant = _angle_quadrant(math.atan2(float(fleet.y) - _center_xy()[1], float(fleet.x) - _center_xy()[0]))
+            if fleet_quadrant != quadrant:
+                continue
+            if int(fleet.owner) == int(player):
+                our_fleet_ships += int(fleet.ships)
+            elif int(fleet.owner) >= 0:
+                enemy_fleet_ships += int(fleet.ships)
+
+        rows.append(
+            [
+                our_ships,
+                our_production,
+                our_big_static,
+                our_small_static,
+                our_rotating_ships,
+                our_fleet_ships,
+                our_established,
+                enemy_ships,
+                enemy_production,
+                enemy_fleet_ships,
+                enemy_established,
+                neutral_ships,
+                neutral_production,
+                neutral_big_static,
+                neutral_small_static,
+                neutral_rotating_ships,
+            ]
+        )
+    return rows
+
+
+def _flatten_quadrant_features(obs, player, planets, fleets, player_count):
+    if _tf_numeric_quadrant_array is not None:
+        rows = _tf_numeric_quadrant_array(obs, player=player, player_count=player_count)
+    else:
+        rows = _fallback_numeric_quadrant_array(planets, fleets, player, player_count)
+    values = []
+    for row in rows:
+        for idx, value in enumerate(row):
+            values.append(float(value) / TACTICAL_FEATURE_SCALES[idx])
+    return values
+
+
+def _flatten_role_features(obs, player, planets):
+    if _tf_role_scores is None:
+        return [len(_operationally_established_quadrants(planets, player)) / 4.0, 0.0, 0.0, 0.0, 0.0]
+
+    labels = _tf_role_scores(obs, player=player, top_n=1)
+
+    def _first_score(key, score_name):
+        items = labels.get(key, [])
+        if not items:
+            return 0.0
+        return float(items[0].get(score_name, 0.0)) / 12.0
+
+    return [
+        len(labels.get("established_quadrants", [])) / 4.0,
+        _first_score("anchor_candidates", "anchor_score"),
+        _first_score("feeder_candidates", "feeder_score"),
+        _first_score("sweeper_candidates", "sweeper_score"),
+        _first_score("strike_stage_candidates", "strike_stage_score"),
+    ]
+
+
+def _flatten_tactical_tendency(tendency):
+    launches = max(1, int(tendency.get("launches", 0)))
+    return [
+        float(tendency.get("launches", 0)) / 400.0,
+        float(tendency.get("ships_launched", 0)) / 20000.0,
+        float(tendency.get("neutral_targets", 0)) / launches,
+        float(tendency.get("enemy_targets", 0)) / launches,
+        float(tendency.get("friendly_targets", 0)) / launches,
+        float(tendency.get("static_targets", 0)) / launches,
+        float(tendency.get("rotating_targets", 0)) / launches,
+        float(tendency.get("central_rotating_big", 0)) / launches,
+        float(tendency.get("central_rotating_small", 0)) / launches,
+        float(tendency.get("captures", 0)) / 80.0,
+        float(tendency.get("losses", 0)) / 80.0,
+    ]
+
+
+def _tactical_feature_vector(step, player, planets, fleets, angular_velocity, tendency):
+    player_count = _player_count(planets, fleets, player)
+    obs = _tactical_obs(player, step, planets, fleets, angular_velocity)
+    features = [
+        min(float(step), TOTAL_STEPS) / TOTAL_STEPS,
+        float(player_count) / 4.0,
+        1.0,
+        1.0 if player_count == 4 else 0.0,
+    ]
+    features.extend(_flatten_quadrant_features(obs, player, planets, fleets, player_count))
+    features.extend(_flatten_role_features(obs, player, planets))
+    features.extend(_flatten_tactical_tendency(tendency))
+    return features
+
+
+def _tactical_tendency(state):
+    tendency = state.get("tactical_tendency")
+    if tendency is None:
+        tendency = _empty_tactical_tendency()
+        state["tactical_tendency"] = tendency
+    return tendency
+
+
+def _update_tactical_events(state, player, planets):
+    tendency = _tactical_tendency(state)
+    current_owner_by_planet = {int(p.id): int(p.owner) for p in planets}
+    previous = state.get("previous_owner_by_planet")
+    if previous is not None:
+        for planet_id, new_owner in current_owner_by_planet.items():
+            old_owner = previous.get(planet_id)
+            if old_owner is None or old_owner == new_owner:
+                continue
+            if new_owner == int(player) and old_owner != int(player):
+                tendency["captures"] += 1
+            elif old_owner == int(player) and new_owner != int(player):
+                tendency["losses"] += 1
+    state["previous_owner_by_planet"] = current_owner_by_planet
+
+
+def _project_tactical_tendency(state, player, target, ships):
+    tendency = dict(_tactical_tendency(state))
+    tendency["launches"] += 1
+    tendency["ships_launched"] += int(ships)
+    if target is not None:
+        if int(target.owner) == NEUTRAL:
+            tendency["neutral_targets"] += 1
+        elif int(target.owner) == int(player):
+            tendency["friendly_targets"] += 1
+        else:
+            tendency["enemy_targets"] += 1
+        if _is_static(target):
+            tendency["static_targets"] += 1
+        else:
+            tendency["rotating_targets"] += 1
+            if int(target.production) >= 5:
+                tendency["central_rotating_big"] += 1
+            else:
+                tendency["central_rotating_small"] += 1
+    return tendency
+
+
+def _record_tactical_move(state, player, target, ships):
+    if state is None or target is None or int(ships) <= 0:
+        return
+    tendency = _tactical_tendency(state)
+    updated = _project_tactical_tendency(state, player, target, ships)
+    tendency.clear()
+    tendency.update(updated)
+
+
+def _commit_targeted_move(state, player, source, target, moves, reserved, angle, ships):
+    sent = _add_move(moves, reserved, source, angle, ships)
+    if sent > 0:
+        state.setdefault("turn_claimed_target_ids", set()).add(int(target.id))
+        _record_tactical_move(state, player, target, sent)
+    return sent
+
+
+def _project_planets_after_capture(planets, player, source, target, ships):
+    projected = []
+    for planet in planets:
+        if planet.id == source.id:
+            projected.append(
+                Planet(
+                    int(planet.id),
+                    int(planet.owner),
+                    float(planet.x),
+                    float(planet.y),
+                    float(planet.radius),
+                    max(0, int(planet.ships) - int(ships)),
+                    int(planet.production),
+                )
+            )
+            continue
+        if planet.id == target.id:
+            projected.append(
+                Planet(
+                    int(planet.id),
+                    int(player),
+                    float(planet.x),
+                    float(planet.y),
+                    float(planet.radius),
+                    max(1, int(ships) - int(target.ships)),
+                    int(planet.production),
+                )
+            )
+            continue
+        projected.append(planet)
+    return projected
+
+
+def _source_role_for_model(state, player, source, planets, fleets):
+    if source is None:
+        return "unknown"
+    if int(source.id) == int(state.get("primary_anchor_id") or -1):
+        return "anchor"
+    if int(source.id) == int(state.get("attacker_planet_id") or -1):
+        return "attacker"
+    if int(source.id) == int(state.get("static_collector_id") or -1):
+        return "feeder"
+
+    role = _our_roles(planets, player, fleets=fleets, state=state).get(int(source.id))
+    if role:
+        return role
+    return "expander"
+
+
+def _phase_name_for_model(state, player, planets, fleets, target=None, primary_anchor_id=None):
+    owned = [planet for planet in planets if int(planet.owner) == int(player)]
+    if len(owned) < 2 and not state.get("opened"):
+        return "initiation"
+
+    established = _operationally_established_quadrants(planets, player)
+    if not established:
+        return "expansion"
+
+    if target is not None and int(target.owner) not in (player, NEUTRAL):
+        return "attack"
+
+    control_half = _current_control_half(
+        state,
+        player,
+        planets,
+        fleets=fleets,
+        primary_anchor_id=primary_anchor_id,
+    )
+    enemy_in_half = any(
+        int(planet.owner) not in (player, NEUTRAL)
+        and (control_half is None or _quadrant(planet) in control_half)
+        for planet in planets
+    )
+    if enemy_in_half:
+        return "attack"
+    return "established"
+
+
+def _predict_tactical_value(state, player, planets, fleets, angular_velocity, step, source, target, ships):
+    model = _load_tactical_model()
+    if (
+        model is None
+        or target is None
+        or int(ships) <= 0
+        or np is None
+        or _tf_action_feature_vector_for_state is None
+        or _tf_action_penalty_profile_for_state is None
+    ):
+        return None
+
+    measurement = _attack_measurement(source, target, ships, angular_velocity, planets=planets)
+    if measurement is None:
+        return None
+    if not measurement.clear:
+        return 0.0
+
+    source_role = _source_role_for_model(state, player, source, planets, fleets)
+    phase_name = _phase_name_for_model(
+        state,
+        player,
+        planets,
+        fleets,
+        target=target,
+        primary_anchor_id=state.get("primary_anchor_id"),
+    )
+    penalty_profile = _tf_action_penalty_profile_for_state(
+        planets,
+        fleets,
+        player,
+        source,
+        target,
+        ships,
+        source_role=source_role,
+        phase_name=phase_name,
+        action_angle=measurement.angle,
+    )
+    features = _tf_action_feature_vector_for_state(
+        planets,
+        fleets,
+        player,
+        source,
+        target,
+        ships,
+        step=step,
+        angular_velocity=angular_velocity,
+        tendency=_tactical_tendency(state),
+        source_role=source_role,
+        phase_name=phase_name,
+        player_count=_player_count(planets, fleets, player),
+        anchor_planet_id=state.get("primary_anchor_id"),
+        attacker_planet_id=state.get("attacker_planet_id"),
+        feeder_planet_id=state.get("static_collector_id"),
+        action_angle=measurement.angle,
+    )
+    if len(features) != int(model["weights"].shape[0]):
+        return None
+
+    vector = np.asarray(features, dtype=np.float32)
+    logits = ((vector - model["mean"]) / model["std"]) @ model["weights"] + model["bias"]
+    score = _sigmoid(float(logits))
+    return max(0.0, min(1.0, score * float(penalty_profile["quality_score"])))
+
+
+def _rerank_targets_with_model(state, player, planets, fleets, angular_velocity, step, source, candidates):
+    if len(candidates) < 2 or _load_tactical_model() is None:
+        return candidates
+
+    candidates = _learning_focus_targets(state, player, planets, fleets, source, candidates)
+    scored = []
+    for idx, target in enumerate(candidates[:TACTICAL_MODEL_TOP_K]):
+        need = _planned_capture_need(source, target, angular_velocity)
+        score = _predict_tactical_value(state, player, planets, fleets, angular_velocity, step, source, target, need)
+        if score is None:
+            return candidates
+        scored.append((score, idx, target))
+
+    selected_ids = {target.id for _, _, target in scored}
+    ranked = [target for _, _, target in sorted(scored, key=lambda item: (-item[0], item[1]))]
+    ranked.extend([target for target in candidates if target.id not in selected_ids])
+    return ranked
 
 
 def _state_for(player, obs):
     state = _STATE.setdefault(
         player,
-        {
-            "bursts": [],
-            "prime_quadrant": None,
-            "opened": False,
-            "opening_target_ids": [],
-            "opening_launched_ids": [],
-            "primary_anchor_id": None,
-        },
+        _fresh_state(),
     )
     turn = _obs_get(obs, "step", _obs_get(obs, "turn", None))
     last_turn = state.get("last_turn")
     if turn is not None and last_turn is not None and turn < last_turn:
         state.clear()
-        state.update(
-            {
-                "bursts": [],
-                "prime_quadrant": None,
-                "opened": False,
-                "opening_target_ids": [],
-                "opening_launched_ids": [],
-                "primary_anchor_id": None,
-            }
-        )
+        state.update(_fresh_state())
     state["last_turn"] = turn
     return state
 
@@ -275,6 +1287,68 @@ def _choose_prime_quadrant(state, my_planets):
     return state["prime_quadrant"]
 
 
+def _reset_opening_state(state, source=None):
+    state["bursts"] = []
+    state["turn_claimed_target_ids"] = set()
+    state["opened"] = False
+    state["opening_target_ids"] = []
+    state["opening_launched_ids"] = []
+    state["primary_anchor_id"] = None
+    state["attacker_planet_id"] = None
+    state["attacker_target_quadrant"] = None
+    state["static_collector_id"] = None
+    state["recent_static_capture_id"] = None
+    state["recent_static_capture_quadrant"] = None
+    if source is not None:
+        state["prime_quadrant"] = _quadrant(source)
+
+
+def _update_recent_static_capture_focus(state, player, planets):
+    by_id = {p.id: p for p in planets}
+    owned_ids = {p.id for p in planets if int(p.owner) == player}
+    previous_owned_ids = state.get("previous_owned_ids")
+    if previous_owned_ids is None:
+        state["previous_owned_ids"] = owned_ids
+        return None
+
+    gained_static = [
+        by_id[planet_id]
+        for planet_id in owned_ids - set(previous_owned_ids)
+        if planet_id in by_id and _is_static(by_id[planet_id])
+    ]
+    if gained_static:
+        focus = max(
+            gained_static,
+            key=lambda p: (int(p.production), float(p.radius), int(p.ships), -_distance_to_center(p)),
+        )
+        state["recent_static_capture_id"] = focus.id
+        state["recent_static_capture_quadrant"] = _quadrant(focus)
+
+    focus = by_id.get(state.get("recent_static_capture_id"))
+    if focus is None or int(focus.owner) != player or not _is_static(focus):
+        state["recent_static_capture_id"] = None
+        state["recent_static_capture_quadrant"] = None
+        focus = None
+    elif _operationally_established_for(planets, player, _quadrant(focus)):
+        state["recent_static_capture_id"] = None
+        state["recent_static_capture_quadrant"] = None
+        focus = None
+
+    state["previous_owned_ids"] = owned_ids
+    return focus
+
+
+def _recent_static_focus(state, player, planets):
+    focus_id = state.get("recent_static_capture_id")
+    focus_quadrant = state.get("recent_static_capture_quadrant")
+    if focus_id is None or focus_quadrant is None:
+        return None, None
+    focus = next((p for p in planets if p.id == focus_id and int(p.owner) == player and _is_static(p)), None)
+    if focus is None:
+        return None, None
+    return focus, int(focus_quadrant)
+
+
 def _drain_bursts(state, player, planets, moves, reserved, angular_velocity):
     by_id = {p.id: p for p in planets}
     next_bursts = []
@@ -289,9 +1363,12 @@ def _drain_bursts(state, player, planets, moves, reserved, angular_velocity):
             next_bursts.append(burst)
             continue
         amount = min(2, int(burst["remaining"]))
-        angle, tx, ty = _aim_at(source, target, amount, angular_velocity)
-        if _clear_of_sun(source, tx, ty):
-            sent = _add_move(moves, reserved, source, angle, amount)
+        if burst.get("require_attack_ready") and not _expansion_ready_for_need(source, reserved, amount):
+            next_bursts.append(burst)
+            continue
+        measurement = _attack_measurement(source, target, amount, angular_velocity, planets=planets)
+        if measurement.clear:
+            sent = _commit_targeted_move(state, player, source, target, moves, reserved, measurement.angle, amount)
             burst["remaining"] -= sent
         if burst["remaining"] > 0:
             next_bursts.append(burst)
@@ -299,7 +1376,13 @@ def _drain_bursts(state, player, planets, moves, reserved, angular_velocity):
 
 
 def _opening_target_key(p):
-    return (int(p.production), float(p.radius), int(p.ships), _distance_to_center(p))
+    return (int(p.ships), int(p.production), float(p.radius), _distance_to_center(p))
+
+
+def _opening_targets_for_quadrant(neutral_planets, quadrant):
+    same_quadrant = [p for p in neutral_planets if _quadrant(p) == quadrant]
+    stationary = [p for p in same_quadrant if _is_static(p)]
+    return sorted(stationary or same_quadrant, key=_opening_target_key)
 
 
 def _cleanup_opening_targets(state, player, planets):
@@ -314,43 +1397,60 @@ def _cleanup_opening_targets(state, player, planets):
         state["opened"] = True
 
 
-def _send_opening_payload(state, source, target, moves, reserved, angular_velocity):
+def _send_opening_payload(state, source, target, moves, reserved, angular_velocity, planets=None):
     need_now = int(target.ships) + 1
     available = _available(source, reserved)
     if available <= 0:
         return False
 
     payload = need_now if available >= need_now else available
-    angle, tx, ty = _aim_at(source, target, payload, angular_velocity)
-    if not _clear_of_sun(source, tx, ty):
+    measurement = _attack_measurement(source, target, payload, angular_velocity, planets=planets)
+    if not measurement.clear:
         return False
 
-    sent = _add_move(moves, reserved, source, angle, payload)
+    sent = _commit_targeted_move(state, int(source.owner), source, target, moves, reserved, measurement.angle, payload)
     if sent <= 0:
         return False
 
     if sent < need_now:
-        remaining = max(0, int(target.ships) + 2 - sent)
+        burst_total = need_now if _is_large_production(source) else int(target.ships) + 2
+        remaining = max(0, burst_total - sent)
         if remaining:
             state.setdefault("bursts", []).append(
-                {"source_id": source.id, "target_id": target.id, "remaining": remaining}
+                {"source_id": source.id, "target_id": target.id, "remaining": remaining, "require_attack_ready": False}
             )
     return True
 
 
-def _send_expansion_payload(state, source, target, moves, reserved, angular_velocity, need=None):
+def _send_expansion_payload(
+    state,
+    source,
+    target,
+    moves,
+    reserved,
+    angular_velocity,
+    need=None,
+    require_attack_ready=False,
+    planets=None,
+):
+    if not _same_equator_side(source, target):
+        return False
+
     if need is None:
-        need = int(target.ships) + 2
+        need = _planned_capture_need(source, target, angular_velocity)
+    if require_attack_ready and not _expansion_ready_for_need(source, reserved, need):
+        return False
+
     available = _available(source, reserved)
-    if available <= 0:
+    if available < need:
         return False
 
-    payload = need if available >= need else available
-    angle, tx, ty = _aim_at(source, target, payload, angular_velocity)
-    if not _clear_of_sun(source, tx, ty):
+    payload = need
+    measurement = _attack_measurement(source, target, payload, angular_velocity, planets=planets)
+    if not measurement.clear:
         return False
 
-    sent = _add_move(moves, reserved, source, angle, payload)
+    sent = _commit_targeted_move(state, int(source.owner), source, target, moves, reserved, measurement.angle, payload)
     if sent <= 0:
         return False
 
@@ -358,9 +1458,189 @@ def _send_expansion_payload(state, source, target, moves, reserved, angular_velo
         remaining = max(0, int(need) - sent)
         if remaining:
             state.setdefault("bursts", []).append(
-                {"source_id": source.id, "target_id": target.id, "remaining": remaining}
+                {
+                    "source_id": source.id,
+                    "target_id": target.id,
+                    "remaining": remaining,
+                    "require_attack_ready": bool(require_attack_ready),
+                }
             )
     return True
+
+
+def _send_staggered_payload(
+    state,
+    source,
+    target,
+    moves,
+    reserved,
+    angular_velocity,
+    need,
+    planets=None,
+):
+    if not _same_equator_side(source, target):
+        return False
+
+    available = _available(source, reserved)
+    if available <= 0:
+        return False
+
+    payload = min(int(need), available)
+    measurement = _attack_measurement(source, target, payload, angular_velocity, planets=planets)
+    if not measurement.clear:
+        return False
+
+    sent = _commit_targeted_move(state, int(source.owner), source, target, moves, reserved, measurement.angle, payload)
+    if sent <= 0:
+        return False
+
+    if sent < int(need):
+        remaining = max(0, int(need) - sent)
+        if remaining:
+            state.setdefault("bursts", []).append(
+                {
+                    "source_id": source.id,
+                    "target_id": target.id,
+                    "remaining": remaining,
+                    "require_attack_ready": False,
+                }
+            )
+    return True
+
+
+def _should_stagger_establishment_capture(source, target, player, planets, need):
+    source_quadrant = _quadrant(source)
+    if _operationally_established_for(planets, player, source_quadrant):
+        return False
+    if int(target.owner) != NEUTRAL or _quadrant(target) != source_quadrant:
+        return False
+    if not _is_static(target) or _is_big(target):
+        return False
+    if int(need) > PRE_ESTABLISHMENT_BURST_MAX_NEED:
+        return False
+    return _is_quadrant_corner_node(target, source_quadrant) or _distance(source, target) <= ATTACK_SUPPORT_RADIUS
+
+
+def _force_nearest_unconquered_move(
+    state,
+    player,
+    planets,
+    fleets,
+    moves,
+    reserved,
+    angular_velocity,
+    step,
+    min_ships=1,
+    require_attack_ready=False,
+):
+    targets = [p for p in planets if int(p.owner) != player]
+    if not targets:
+        return False
+
+    claimed_target_ids = _claimed_target_ids(state, player, planets, fleets)
+    sources = [
+        p
+        for p in planets
+        if int(p.owner) == player and _available(p, reserved) >= int(min_ships)
+    ]
+    sources.sort(key=lambda p: (-_available(p, reserved), _distance_to_center(p)))
+
+    for source in sources:
+        attack_candidates = _serious_attack_targets(
+            state,
+            source,
+            player,
+            planets,
+            fleets,
+            reserved,
+            claimed_target_ids,
+            angular_velocity,
+            step,
+        )
+        for target, need in attack_candidates[:8]:
+            if _send_expansion_payload(
+                state,
+                source,
+                target,
+                moves,
+                reserved,
+                angular_velocity,
+                need=need,
+                require_attack_ready=require_attack_ready,
+                planets=planets,
+            ):
+                return True
+
+        candidates = _nearest_unconquered_targets(
+            state,
+            source,
+            player,
+            planets,
+            fleets,
+            claimed_target_ids,
+            angular_velocity,
+            step,
+        )
+        if not candidates:
+            fallback_targets = [target for target in targets if target.id not in claimed_target_ids]
+            candidates = sorted(_same_equator_targets(source, fallback_targets), key=lambda p: _smallest_target_key(source, p))
+            candidates = _rerank_targets_with_model(state, player, planets, fleets, angular_velocity, step, source, candidates)
+        for target in candidates[:16]:
+            need = _planned_capture_need(source, target, angular_velocity)
+            if _should_stagger_establishment_capture(source, target, player, planets, need):
+                if _send_staggered_payload(
+                    state,
+                    source,
+                    target,
+                    moves,
+                    reserved,
+                    angular_velocity,
+                    need=need,
+                    planets=planets,
+                ):
+                    return True
+            if _send_expansion_payload(
+                state,
+                source,
+                target,
+                moves,
+                reserved,
+                angular_velocity,
+                need=need,
+                require_attack_ready=require_attack_ready,
+                planets=planets,
+            ):
+                return True
+    return False
+
+
+def _unstick_opening_if_stalled(state, player, planets, fleets, moves, reserved, angular_velocity, step):
+    if moves:
+        return False
+
+    my_planets = [p for p in planets if int(p.owner) == player]
+    if len(my_planets) != 1:
+        return False
+
+    source = max(my_planets, key=lambda p: _available(p, reserved))
+    if _available(source, reserved) < OPENING_STALL_SHIPS:
+        return False
+
+    _reset_opening_state(state, source)
+    _initiation_phase(state, player, planets, moves, reserved, angular_velocity)
+    if moves:
+        return True
+    return _force_nearest_unconquered_move(
+        state,
+        player,
+        planets,
+        fleets,
+        moves,
+        reserved,
+        angular_velocity,
+        step,
+        min_ships=OPENING_STALL_SHIPS,
+    )
 
 
 def _initiation_phase(state, player, planets, moves, reserved, angular_velocity):
@@ -379,7 +1659,7 @@ def _initiation_phase(state, player, planets, moves, reserved, angular_velocity)
         state["opened"] = True
         return
 
-    targets = sorted([p for p in neutral_planets if _quadrant(p) == prime_quadrant], key=_opening_target_key)
+    targets = _opening_targets_for_quadrant(neutral_planets, prime_quadrant)
     if not targets:
         state["opened"] = True
         return
@@ -393,7 +1673,8 @@ def _initiation_phase(state, player, planets, moves, reserved, angular_velocity)
     if len(launched_target_ids) >= 2:
         return
 
-    burst_target_ids = {burst["target_id"] for burst in state.get("bursts", [])}
+    burst_target_ids = set(state.get("turn_claimed_target_ids", set()))
+    burst_target_ids.update(int(burst["target_id"]) for burst in state.get("bursts", []))
     desired_targets = [target for target in targets if target.id not in launched_target_ids]
 
     for target in desired_targets:
@@ -402,22 +1683,352 @@ def _initiation_phase(state, player, planets, moves, reserved, angular_velocity)
         if target.id in active_target_ids or target.id in burst_target_ids:
             continue
         source = max(source_pool, key=lambda p: _available(p, reserved))
-        if _send_opening_payload(state, source, target, moves, reserved, angular_velocity):
+        if _send_opening_payload(state, source, target, moves, reserved, angular_velocity, planets=planets):
             state.setdefault("opening_target_ids", []).append(target.id)
             state.setdefault("opening_launched_ids", []).append(target.id)
             active_target_ids.add(target.id)
             launched_target_ids.add(target.id)
 
 
-def _established_for(planets, owner, quadrant):
+def _role_ready_for(planets, owner, quadrant):
     big_static, small_static = _quadrant_corner_role_groups(planets, owner, quadrant)
     return len(big_static) >= 1 and len(small_static) >= 2
 
 
-def _our_roles(planets, player):
+def _established_for(planets, owner, quadrant):
+    anchor = _quadrant_anchor_planet(planets, quadrant)
+    return anchor is not None and int(anchor.owner) == int(owner)
+
+
+def _quadrant_anchor_planet(planets, quadrant):
+    quadrant = int(quadrant)
+    corner_nodes = _corner_nodes_for_quadrant(planets, quadrant)
+    candidates = corner_nodes or [p for p in planets if _is_static(p) and _quadrant(p) == quadrant]
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda p: (
+            _distance_to_quadrant_corner(p, quadrant),
+            -int(p.production),
+            int(p.ships),
+            int(p.id),
+        ),
+    )
+
+
+def _operationally_established_for(planets, owner, quadrant):
+    return _established_for(planets, owner, quadrant)
+
+
+def _any_established(planets, owner):
+    return any(_established_for(planets, owner, quadrant) for quadrant in range(4))
+
+
+def _established_quadrants(planets, owner):
+    return {quadrant for quadrant in range(4) if _established_for(planets, owner, quadrant)}
+
+
+def _open_quadrants(planets, owner):
+    established = _established_quadrants(planets, owner)
+    return [quadrant for quadrant in range(4) if quadrant not in established]
+
+
+def _operationally_any_established(planets, owner):
+    return any(_operationally_established_for(planets, owner, quadrant) for quadrant in range(4))
+
+
+def _operationally_established_quadrants(planets, owner):
+    return {quadrant for quadrant in range(4) if _operationally_established_for(planets, owner, quadrant)}
+
+
+def _operationally_open_quadrants(planets, owner):
+    established = _operationally_established_quadrants(planets, owner)
+    return [quadrant for quadrant in range(4) if quadrant not in established]
+
+
+def _best_anchor_quadrant(player, planets, fleets=None):
+    best = None
+    best_score = None
+    for quadrant in range(4):
+        anchor = _quadrant_anchor_planet(planets, quadrant)
+        if anchor is None or int(anchor.owner) != player:
+            continue
+        local_margin = _quadrant_control_margin(player, quadrant, planets, fleets=fleets)
+        half_margin = max(
+            _half_control_margin(player, (quadrant, adjacent), planets, fleets=fleets)
+            for adjacent in _adjacent_quadrants(quadrant)
+        )
+        score = (
+            half_margin,
+            local_margin,
+            int(anchor.production),
+            int(anchor.ships),
+            -_distance_to_quadrant_corner(anchor, quadrant),
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best = quadrant
+    return best
+
+
+def _current_control_half(state, player, planets, fleets=None, primary_anchor_id=None, claimed_target_ids=None):
+    by_id = {p.id: p for p in planets}
+    anchor = by_id.get(primary_anchor_id or state.get("primary_anchor_id"))
+    if anchor is None or int(anchor.owner) != player:
+        best_anchor_quadrant = _best_anchor_quadrant(player, planets, fleets=fleets)
+        if best_anchor_quadrant is None:
+            return None
+        anchor = _quadrant_anchor_planet(planets, best_anchor_quadrant)
+        if anchor is None or int(anchor.owner) != player:
+            return None
+
+    anchor_quadrant = _quadrant(anchor)
+    attacker_target_quadrant = state.get("attacker_target_quadrant")
+    if attacker_target_quadrant in _adjacent_quadrants(anchor_quadrant):
+        return (anchor_quadrant, int(attacker_target_quadrant))
+
+    claimed_target_ids = claimed_target_ids or set()
+    best_half = None
+    best_score = None
+    for adjacent in _adjacent_quadrants(anchor_quadrant):
+        targets = _attack_quadrant_targets(planets, player, adjacent, claimed_target_ids)
+        focus = targets[0] if targets else None
+        score = (
+            _half_control_margin(player, (anchor_quadrant, adjacent), planets, fleets=fleets),
+            1 if focus is not None else 0,
+            -(int(focus.ships) if focus is not None else 999),
+            int(focus.production) if focus is not None else 0,
+            -(_distance(anchor, focus) if focus is not None else 999.0),
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best_half = (anchor_quadrant, adjacent)
+    return best_half
+
+
+def _attack_quadrant_targets(planets, player, quadrant, claimed_target_ids):
+    needed = _needed_establishment_targets(planets, player, quadrant, claimed_target_ids)
+    if needed:
+        return needed
+
+    candidates = [
+        p
+        for p in planets
+        if int(p.owner) != player and _quadrant(p) == int(quadrant) and p.id not in claimed_target_ids
+    ]
+    return sorted(
+        candidates,
+        key=lambda p: (
+            int(p.owner) != NEUTRAL,
+            not _is_static(p),
+            int(p.ships),
+            -int(p.production),
+            _distance_to_quadrant_corner(p, quadrant),
+        ),
+    )
+
+
+def _attacker_stage_goal(attacker, target_quadrant):
+    if attacker is None or target_quadrant is None:
+        return ATTACKER_STAGE_TARGET_SHIPS
+    if _quadrant(attacker) == int(target_quadrant):
+        return ATTACKER_STAGE_IN_QUADRANT_SHIPS
+    return ATTACKER_STAGE_TARGET_SHIPS
+
+
+def _sync_attacker_stage(state, player, planets, reserved, claimed_target_ids, primary_anchor_id=None):
+    if not _operationally_any_established(planets, player):
+        state["attacker_planet_id"] = None
+        state["attacker_target_quadrant"] = None
+        return None, None
+
+    by_id = {p.id: p for p in planets}
+    anchor = by_id.get(primary_anchor_id or state.get("primary_anchor_id"))
+    if anchor is None or int(anchor.owner) != player:
+        prime_quadrant = _choose_prime_quadrant(state, [p for p in planets if int(p.owner) == player])
+        anchor = _quadrant_anchor_planet(planets, prime_quadrant)
+        if anchor is None or int(anchor.owner) != player:
+            state["attacker_planet_id"] = None
+            state["attacker_target_quadrant"] = None
+            return None, None
+
+    anchor_quadrant = _quadrant(anchor)
+    control_half = _current_control_half(
+        state,
+        player,
+        planets,
+        primary_anchor_id=primary_anchor_id,
+        claimed_target_ids=claimed_target_ids,
+    )
+    if not control_half:
+        state["attacker_planet_id"] = None
+        state["attacker_target_quadrant"] = None
+        return None, None
+
+    open_quadrants = [quadrant for quadrant in control_half if quadrant != anchor_quadrant and not _operationally_established_for(planets, player, quadrant)]
+    if not open_quadrants:
+        state["attacker_planet_id"] = None
+        state["attacker_target_quadrant"] = None
+        return None, None
+
+    target_quadrant = state.get("attacker_target_quadrant")
+    current_targets = (
+        _attack_quadrant_targets(planets, player, target_quadrant, claimed_target_ids)
+        if target_quadrant in open_quadrants
+        else []
+    )
+    if target_quadrant not in open_quadrants or not current_targets:
+        best_quadrant = None
+        best_score = None
+        for quadrant in open_quadrants:
+            targets = _attack_quadrant_targets(planets, player, quadrant, claimed_target_ids)
+            if not targets:
+                continue
+            focus = targets[0]
+            score = (
+                _half_control_margin(player, control_half, planets),
+                int(focus.owner) != NEUTRAL,
+                -int(focus.ships),
+                int(focus.production),
+                -(0 if _same_equator_side(anchor, focus) else 1),
+                -_distance(anchor, focus),
+            )
+            if best_score is None or score > best_score:
+                best_score = score
+                best_quadrant = quadrant
+        target_quadrant = best_quadrant if best_quadrant is not None else open_quadrants[0]
+        state["attacker_target_quadrant"] = target_quadrant
+        current_targets = _attack_quadrant_targets(planets, player, target_quadrant, claimed_target_ids)
+
+    if target_quadrant is None or not current_targets:
+        state["attacker_planet_id"] = None
+        return None, None
+
+    focus = current_targets[0]
+    current_attacker = by_id.get(state.get("attacker_planet_id"))
+    if (
+        current_attacker is not None
+        and int(current_attacker.owner) == player
+        and current_attacker.id != primary_anchor_id
+    ):
+        return target_quadrant, current_attacker
+
+    candidates = [
+        p
+        for p in planets
+        if int(p.owner) == player and p.id != primary_anchor_id
+    ]
+    if not candidates:
+        state["attacker_planet_id"] = None
+        return target_quadrant, None
+
+    attacker = min(
+        candidates,
+        key=lambda p: (
+            _quadrant(p) != target_quadrant,
+            0 if _same_equator_side(p, focus) else 1,
+            _quadrant_distance(_quadrant(p), target_quadrant),
+            _is_big(p),
+            _distance(p, focus),
+            _available(p, reserved) <= 0,
+            -_available(p, reserved),
+        ),
+    )
+    state["attacker_planet_id"] = attacker.id
+    return target_quadrant, attacker
+
+
+def _feed_attacker(
+    state,
+    player,
+    source,
+    planets,
+    moves,
+    reserved,
+    angular_velocity,
+    claimed_target_ids,
+    keep_ships,
+    min_batch,
+    primary_anchor_id=None,
+):
+    target_quadrant, attacker = _sync_attacker_stage(
+        state,
+        player,
+        planets,
+        reserved,
+        claimed_target_ids,
+        primary_anchor_id=primary_anchor_id,
+    )
+    if attacker is None or target_quadrant is None or attacker.id == source.id:
+        return False
+
+    if _operationally_established_for(planets, player, target_quadrant):
+        return False
+
+    transferable = _available(source, reserved) - int(keep_ships)
+    if transferable <= 0:
+        return False
+
+    desired_total = _attacker_stage_goal(attacker, target_quadrant)
+    deficit = max(0, int(desired_total) - int(attacker.ships))
+    if deficit <= 0:
+        return False
+
+    amount = min(transferable, deficit)
+    if amount < int(min_batch):
+        return False
+
+    measurement = _attack_measurement(source, attacker, amount, angular_velocity, planets=planets)
+    if not measurement.clear:
+        return False
+
+    return _commit_targeted_move(state, player, source, attacker, moves, reserved, measurement.angle, amount) > 0
+
+
+def _quadrant_distance(a, b):
+    clockwise = (int(a) - int(b)) % 4
+    counter_clockwise = (int(b) - int(a)) % 4
+    return min(clockwise, counter_clockwise)
+
+
+def _target_quadrant_rank(source_quadrant, target_quadrant, established_quadrants):
+    source_quadrant = int(source_quadrant)
+    target_quadrant = int(target_quadrant)
+    source_established = source_quadrant in established_quadrants
+    target_established = target_quadrant in established_quadrants
+
+    if not source_established:
+        if target_quadrant == source_quadrant:
+            return 0
+        if not target_established:
+            return 2 + _quadrant_distance(source_quadrant, target_quadrant)
+        return 8 + _quadrant_distance(source_quadrant, target_quadrant)
+
+    if not target_established:
+        return _quadrant_distance(source_quadrant, target_quadrant)
+    if target_quadrant == source_quadrant:
+        return 6
+    return 7 + _quadrant_distance(source_quadrant, target_quadrant)
+
+
+def _our_roles(planets, player, fleets=None, state=None):
+    if _tf_infer_roles is not None and fleets is not None:
+        try:
+            return _tf_infer_roles(
+                planets,
+                fleets,
+                player,
+                anchor_planet_id=(state or {}).get("primary_anchor_id"),
+                attacker_planet_id=(state or {}).get("attacker_planet_id"),
+                feeder_planet_id=(state or {}).get("static_collector_id"),
+            )
+        except Exception:
+            pass
+
     roles = {}
     for quadrant in range(4):
-        if not _established_for(planets, player, quadrant):
+        if not _role_ready_for(planets, player, quadrant):
             continue
         bigs, smalls = _quadrant_corner_role_groups(planets, player, quadrant)
         bigs = sorted(bigs, key=lambda p: -int(p.ships))
@@ -455,12 +2066,27 @@ def _incoming_threats(player, planets, fleets):
 def _reactive_trap(player, planets, fleets, moves, reserved, blocked_source_ids=None):
     blocked_source_ids = blocked_source_ids or set()
     responded = set()
-    for _, fleet, target in _incoming_threats(player, planets, fleets):
+    established = _operationally_any_established(planets, player)
+    for eta, fleet, target in _incoming_threats(player, planets, fleets):
         if target.id in responded or target.id in blocked_source_ids:
             continue
         needed = int(fleet.ships) + 1
-        if _available(target, reserved) >= needed:
-            _add_move(moves, reserved, target, float(fleet.angle) + math.pi, needed)
+        available = _available(target, reserved)
+        if available < needed:
+            continue
+
+        trap_angle = float(fleet.angle) + math.pi
+        if not established:
+            if eta > PRE_ESTABLISHMENT_TRAP_MAX_ETA:
+                continue
+            if available - needed < PRE_ESTABLISHMENT_TRAP_SPARE_SHIPS:
+                continue
+            first_hit = _first_planet_on_ray(target, trap_angle, planets)
+            if first_hit is not None and int(first_hit.owner) == player:
+                continue
+
+        sent = _add_move(moves, reserved, target, trap_angle, needed)
+        if sent > 0:
             responded.add(target.id)
 
 
@@ -483,64 +2109,232 @@ def _opposite_tangent(source, target):
     return math.cos(source_theta - target_theta) < 0.0
 
 
-def _try_capture(source, target, moves, reserved, angular_velocity, max_payload=None):
+def _try_capture(
+    state,
+    player,
+    source,
+    target,
+    moves,
+    reserved,
+    angular_velocity,
+    max_payload=None,
+    require_attack_ready=False,
+    planets=None,
+):
     need = _capture_need(source, target, angular_velocity)
     if max_payload is not None:
         need = min(need, int(max_payload))
+    if require_attack_ready and not _capture_ready_for_need(source, reserved, need):
+        return False
+
     if _available(source, reserved) < need:
         return False
-    angle, tx, ty = _aim_at(source, target, need, angular_velocity)
-    if not _clear_of_sun(source, tx, ty):
+    measurement = _attack_measurement(source, target, need, angular_velocity, planets=planets)
+    if not measurement.clear:
         return False
-    return _add_move(moves, reserved, source, angle, need) > 0
+    return _commit_targeted_move(state, player, source, target, moves, reserved, measurement.angle, need) > 0
 
 
-def _feeder_logic(player, planets, moves, reserved, angular_velocity):
-    for quadrant in range(4):
-        if not _established_for(planets, player, quadrant):
-            continue
-        open_quadrants = [q for q in range(4) if q != quadrant and not _established_for(planets, player, q)]
-        if not open_quadrants:
-            continue
-        feeder_pool = [
+def _static_collector_source(state, player, planets, reserved, primary_anchor_id=None):
+    established_quadrants = _operationally_established_quadrants(planets, player)
+    if not established_quadrants:
+        state["static_collector_id"] = None
+        return None
+
+    by_id = {p.id: p for p in planets}
+    current = by_id.get(state.get("static_collector_id"))
+    if (
+        current is not None
+        and int(current.owner) == player
+        and _is_static(current)
+        and _quadrant(current) in established_quadrants
+        and current.id != primary_anchor_id
+    ):
+        return current
+
+    cx, _ = _center_xy()
+    candidates = [
+        p
+        for p in planets
+        if int(p.owner) == player
+        and _is_static(p)
+        and _quadrant(p) in established_quadrants
+        and p.id != primary_anchor_id
+    ]
+    if not candidates:
+        candidates = [
             p
             for p in planets
-            if int(p.owner) == player and _is_static(p) and _quadrant(p) == quadrant and _available(p, reserved) > 8
+            if int(p.owner) == player
+            and _is_static(p)
+            and _quadrant(p) in established_quadrants
         ]
-        if not feeder_pool:
-            continue
-        feeder = min(feeder_pool, key=lambda p: _distance_to_center(p))
-        target_quadrant = min(open_quadrants, key=lambda q: abs(q - quadrant) % 4)
-        targets = [
-            p
-            for p in planets
-            if int(p.owner) != player and _is_static(p) and _quadrant(p) == target_quadrant
-        ]
-        target = min(targets, key=lambda p: (int(p.owner) != NEUTRAL, int(p.ships), _distance(feeder, p)), default=None)
-        if target is not None:
-            _try_capture(feeder, target, moves, reserved, angular_velocity)
+    if not candidates:
+        state["static_collector_id"] = None
+        return None
+
+    collector = min(
+        candidates,
+        key=lambda p: (
+            _available(p, reserved) <= 0,
+            _is_big(p),
+            abs(float(p.x) - cx),
+            _distance_to_center(p),
+            -int(p.ships),
+        ),
+    )
+    state["static_collector_id"] = collector.id
+    return collector
 
 
-def _role_actions(player, planets, moves, reserved, roles, angular_velocity):
+def _static_collector_targets(source, player, planets, claimed_target_ids):
+    return [
+        p
+        for p in planets
+        if int(p.owner) != player
+        and _is_static(p)
+        and p.id not in claimed_target_ids
+        and _same_equator_side(source, p)
+    ]
+
+
+def _feeder_logic(state, player, planets, fleets, moves, reserved, angular_velocity, step, primary_anchor_id=None):
+    collector = _static_collector_source(
+        state,
+        player,
+        planets,
+        reserved,
+        primary_anchor_id=primary_anchor_id,
+    )
+    if collector is None or _available(collector, reserved) <= 0:
+        return
+
+    claimed_target_ids = _claimed_target_ids(state, player, planets, fleets)
+    if _feed_attacker(
+        state,
+        player,
+        collector,
+        planets,
+        moves,
+        reserved,
+        angular_velocity,
+        claimed_target_ids,
+        keep_ships=16 if _is_big(collector) else 10,
+        min_batch=ATTACKER_STAGE_MIN_FEED,
+        primary_anchor_id=primary_anchor_id,
+    ):
+        return
+
+    targets = _static_collector_targets(collector, player, planets, claimed_target_ids)
+    if not targets:
+        return
+
+    assault_targets = _established_static_assault_targets(
+        state,
+        collector,
+        player,
+        planets,
+        fleets,
+        reserved,
+        claimed_target_ids,
+        angular_velocity,
+        step,
+    )
+    for target, need in assault_targets[:8]:
+        if _send_expansion_payload(
+            state,
+            collector,
+            target,
+            moves,
+            reserved,
+            angular_velocity,
+            need=need,
+            require_attack_ready=True,
+            planets=planets,
+        ):
+            return
+
+    control_half = _current_control_half(
+        state,
+        player,
+        planets,
+        fleets=fleets,
+        primary_anchor_id=primary_anchor_id,
+        claimed_target_ids=claimed_target_ids,
+    )
+    established_quadrants = _operationally_established_quadrants(planets, player)
+    open_quadrants = (set(control_half) if control_half else set(range(4))) - established_quadrants
+    needed_ids = set()
+    for quadrant in open_quadrants:
+        needed_ids.update(p.id for p in _needed_establishment_targets(planets, player, quadrant, claimed_target_ids))
+
+    source_quadrant = _quadrant(collector)
+
+    def score(target):
+        profile = _planet_profile(target, player=player, planets=planets)
+        return (
+            profile.quadrant not in open_quadrants,
+            target.id not in needed_ids if needed_ids else False,
+            "neutral" not in profile.labels,
+            "easy" not in profile.labels,
+            int(target.ships),
+            _quadrant_distance(source_quadrant, profile.quadrant),
+            _distance(collector, target),
+            -int(target.production),
+        )
+
+    ranked_targets = sorted(targets, key=score)
+    ranked_targets = _rerank_targets_with_model(state, player, planets, fleets, angular_velocity, step, collector, ranked_targets)
+    for target in ranked_targets[:16]:
+        need = _planned_capture_need(collector, target, angular_velocity)
+        if _send_expansion_payload(
+            state,
+            collector,
+            target,
+            moves,
+            reserved,
+            angular_velocity,
+            need=need,
+            require_attack_ready=True,
+            planets=planets,
+        ):
+            return
+
+
+def _role_actions(state, player, planets, fleets, moves, reserved, roles, angular_velocity, step, blocked_source_ids=None):
+    blocked_source_ids = blocked_source_ids or set()
     by_id = {p.id: p for p in planets}
     _, cy = _center_xy()
+    control_half = _current_control_half(state, player, planets, fleets=fleets)
+    open_quadrant_set = set(_operationally_open_quadrants(planets, player))
+    if control_half:
+        open_quadrant_set &= set(control_half)
     for planet_id, role in roles.items():
         source = by_id.get(planet_id)
         if source is None or int(source.owner) != player:
             continue
+        if source.id in blocked_source_ids:
+            continue
         targets = [p for p in planets if int(p.owner) != player]
-        if role == "sweeper" and _available(source, reserved) >= 12:
-            equator_targets = [p for p in targets if abs(float(p.y) - cy) <= 16.0]
-            target = min(equator_targets, key=lambda p: (_distance(source, p), int(p.ships)), default=None)
-            if target is not None:
-                _try_capture(source, target, moves, reserved, angular_velocity)
-        elif role == "shield" and _available(source, reserved) >= 34:
-            target = min(targets, key=lambda p: (_distance(source, p), int(p.owner) != NEUTRAL), default=None)
-            if target is not None:
+        local_targets = _same_equator_targets(source, targets)
+        expansion_targets = [p for p in local_targets if _quadrant(p) in open_quadrant_set] or local_targets
+        if role == "sweeper" and _source_can_attempt_capture(source, reserved):
+            equator_targets = [p for p in expansion_targets if abs(float(p.y) - cy) <= 16.0]
+            ranked_targets = sorted(equator_targets, key=lambda p: _smallest_target_key(source, p))
+            ranked_targets = _rerank_targets_with_model(state, player, planets, fleets, angular_velocity, step, source, ranked_targets)
+            for target in ranked_targets[:16]:
+                if _try_capture(state, player, source, target, moves, reserved, angular_velocity, require_attack_ready=True, planets=planets):
+                    break
+        elif role == "shield" and _source_can_attempt_capture(source, reserved):
+            ranked_targets = sorted(expansion_targets, key=lambda p: _smallest_target_key(source, p))
+            ranked_targets = _rerank_targets_with_model(state, player, planets, fleets, angular_velocity, step, source, ranked_targets)
+            for target in ranked_targets[:16]:
                 amount = min(30, max(20, _available(source, reserved) - 12))
-                angle, tx, ty = _aim_at(source, target, amount, angular_velocity)
-                if _clear_of_sun(source, tx, ty):
-                    _add_move(moves, reserved, source, angle, amount)
+                if amount <= 0:
+                    continue
+                measurement = _attack_measurement(source, target, amount, angular_velocity, planets=planets)
+                if measurement.clear and _commit_targeted_move(state, player, source, target, moves, reserved, measurement.angle, amount) > 0:
+                    break
         elif role == "battery":
             # Batteries only act in striker mode; otherwise they stockpile 60-100 ships.
             continue
@@ -549,10 +2343,10 @@ def _role_actions(player, planets, moves, reserved, roles, angular_velocity):
 def _enemy_established(planets, enemy_owner, quadrant):
     if enemy_owner == NEUTRAL:
         return False
-    return _established_for(planets, enemy_owner, quadrant)
+    return _operationally_established_for(planets, enemy_owner, quadrant)
 
 
-def _striker_mode(player, planets, moves, reserved, roles, angular_velocity, primary_anchor_id=None):
+def _striker_mode(state, player, planets, fleets, moves, reserved, roles, angular_velocity, step, primary_anchor_id=None):
     batteries = [
         p
         for p in planets
@@ -564,7 +2358,7 @@ def _striker_mode(player, planets, moves, reserved, roles, angular_velocity, pri
         return
 
     for battery in sorted(batteries, key=lambda p: -int(p.ships)):
-        if _available(battery, reserved) < 60:
+        if _available(battery, reserved) < 60 or not _source_can_attempt_capture(battery, reserved):
             continue
         source_quadrant = _quadrant(battery)
         target_quadrant = _opposite_quadrant(source_quadrant)
@@ -577,42 +2371,60 @@ def _striker_mode(player, planets, moves, reserved, roles, angular_velocity, pri
         ]
         if not enemy_targets:
             continue
-        target = min(enemy_targets, key=lambda p: (int(p.ships), _distance(battery, p)))
-        probe = min(probes, key=lambda p: (_distance(p, target), _distance(battery, p)))
-        combined = _available(battery, reserved) + _available(probe, reserved)
-        if combined < 2 * int(target.ships) + 1:
-            continue
-        if probe.id != battery.id and _available(battery, reserved) >= 60:
-            payload = min(_available(battery, reserved) - 20, max(40, int(target.ships) + 15))
-            if payload > 0:
-                angle, tx, ty = _aim_at(battery, probe, payload, angular_velocity)
-                if _clear_of_sun(battery, tx, ty):
-                    _add_move(moves, reserved, battery, angle, payload)
-        if _available(probe, reserved) >= int(target.ships) + 1:
-            _try_capture(probe, target, moves, reserved, angular_velocity)
+        ranked_targets = sorted(enemy_targets, key=lambda p: (int(p.ships), _distance(battery, p)))
+        ranked_targets = _rerank_targets_with_model(state, player, planets, fleets, angular_velocity, step, battery, ranked_targets)
+        for target in ranked_targets[:16]:
+            direct_need = _offensive_capture_need(battery, target, player, planets, fleets, angular_velocity)
+            if direct_need <= _available(battery, reserved):
+                direct_measurement = _attack_measurement(battery, target, direct_need, angular_velocity, planets=planets)
+                if direct_measurement.clear:
+                    if _commit_targeted_move(
+                        state,
+                        player,
+                        battery,
+                        target,
+                        moves,
+                        reserved,
+                        direct_measurement.angle,
+                        direct_need,
+                    ) > 0:
+                        break
+
+            probe = min(probes, key=lambda p: (_distance(p, target), _distance(battery, p)))
+            combined = _available(battery, reserved) + _available(probe, reserved)
+            if combined < 2 * int(target.ships) + 1:
+                continue
+            if probe.id != battery.id and _available(battery, reserved) >= 60:
+                payload = min(_available(battery, reserved) - 20, max(40, int(target.ships) + 15))
+                if payload > 0:
+                    measurement = _attack_measurement(battery, probe, payload, angular_velocity, planets=planets)
+                    if measurement.clear:
+                        _commit_targeted_move(state, player, battery, probe, moves, reserved, measurement.angle, payload)
+            if _available(probe, reserved) >= int(target.ships) + 1 and _try_capture(
+                state,
+                player,
+                probe,
+                target,
+                moves,
+                reserved,
+                angular_velocity,
+                require_attack_ready=True,
+                planets=planets,
+            ):
+                break
 
 
 def _update_primary_anchor(state, player, planets):
-    my_planets = [p for p in planets if int(p.owner) == player]
-    prime_quadrant = _choose_prime_quadrant(state, my_planets)
-    anchor_id = state.get("primary_anchor_id")
-    current_anchor = next((p for p in my_planets if p.id == anchor_id), None)
-    if (
-        current_anchor is not None
-        and _is_quadrant_big(current_anchor, planets, prime_quadrant)
-    ):
-        return current_anchor
-
-    candidates = [
-        p
-        for p in my_planets
-        if _is_quadrant_big(p, planets, prime_quadrant)
-    ]
-    if not candidates:
+    if not _operationally_any_established(planets, player):
         state["primary_anchor_id"] = None
         return None
 
-    anchor = min(candidates, key=lambda p: (int(p.id), -int(p.ships)))
+    best_anchor_quadrant = _best_anchor_quadrant(player, planets)
+    anchor = _quadrant_anchor_planet(planets, best_anchor_quadrant) if best_anchor_quadrant is not None else None
+    if anchor is None or int(anchor.owner) != player:
+        state["primary_anchor_id"] = None
+        return None
+
     state["primary_anchor_id"] = anchor.id
     return anchor
 
@@ -621,7 +2433,7 @@ def _primary_anchor_in_battery_mode(state, player, planets):
     anchor = _update_primary_anchor(state, player, planets)
     if anchor is None:
         return None
-    if _established_for(planets, player, _quadrant(anchor)):
+    if _operationally_established_for(planets, player, _quadrant(anchor)):
         return anchor
     return None
 
@@ -631,24 +2443,59 @@ def _primary_anchor_action(state, player, planets, moves, reserved, angular_velo
     if anchor is None:
         return
 
+    claimed_target_ids = _claimed_target_ids(state, player, planets, [])
+    if _feed_attacker(
+        state,
+        player,
+        anchor,
+        planets,
+        moves,
+        reserved,
+        angular_velocity,
+        claimed_target_ids,
+        keep_ships=32 if _is_big(anchor) else 18,
+        min_batch=ATTACKER_STAGE_BIG_FEED if _is_big(anchor) else ATTACKER_STAGE_MIN_FEED,
+        primary_anchor_id=anchor.id,
+    ):
+        return
+
     anchor_quadrant = _quadrant(anchor)
     _, small_nodes = _quadrant_corner_role_groups(planets, player, anchor_quadrant)
     small_nodes = [p for p in small_nodes if p.id != anchor.id]
     if not small_nodes or _available(anchor, reserved) <= 60:
         return
 
-    target = min(small_nodes, key=lambda p: (int(p.ships), _distance(anchor, p)))
-    amount = min(_available(anchor, reserved) - 60, max(0, 35 - int(target.ships)))
+    reinforcement_needs = [
+        (planet, _small_node_hold_level(player, planet, planets))
+        for planet in small_nodes
+    ]
+    candidates = [
+        (planet, hold_level)
+        for planet, hold_level in reinforcement_needs
+        if int(planet.ships) < hold_level
+    ]
+    if not candidates:
+        return
+
+    target, hold_level = min(
+        candidates,
+        key=lambda item: (
+            int(item[0].ships) - int(item[1]),
+            int(item[0].ships),
+            _distance(anchor, item[0]),
+        ),
+    )
+    amount = min(_available(anchor, reserved) - 60, max(0, int(hold_level) - int(target.ships)))
     if amount <= 0:
         return
 
-    angle, tx, ty = _aim_at(anchor, target, amount, angular_velocity)
-    if _clear_of_sun(anchor, tx, ty):
-        _add_move(moves, reserved, anchor, angle, amount)
+    measurement = _attack_measurement(anchor, target, amount, angular_velocity, planets=planets)
+    if measurement.clear:
+        _commit_targeted_move(state, player, anchor, target, moves, reserved, measurement.angle, amount)
 
 
 def _needed_establishment_targets(planets, player, quadrant, claimed_target_ids):
-    if _established_for(planets, player, quadrant):
+    if _operationally_established_for(planets, player, quadrant):
         return []
 
     owned_bigs, owned_smalls = _quadrant_corner_role_groups(planets, player, quadrant)
@@ -661,41 +2508,432 @@ def _needed_establishment_targets(planets, player, quadrant, claimed_target_ids)
         and _is_quadrant_corner_node(p, quadrant)
     ]
 
-    needed = []
-    if big_production is not None and not owned_bigs:
-        needed.extend([p for p in corner_targets if int(p.production) == big_production])
+    small_targets = sorted(
+        [p for p in corner_targets if big_production is None or int(p.production) < big_production],
+        key=lambda p: (int(p.ships), _distance_to_quadrant_corner(p, quadrant), _distance_to_center(p)),
+    )
+    big_targets = sorted(
+        [p for p in corner_targets if big_production is not None and int(p.production) == big_production],
+        key=lambda p: (int(p.ships), _distance_to_quadrant_corner(p, quadrant), _distance_to_center(p)),
+    )
+
     if len(owned_smalls) < 2:
-        small_targets = [p for p in corner_targets if big_production is None or int(p.production) < big_production]
-        needed.extend(small_targets or [p for p in corner_targets if p not in needed])
-    return needed or corner_targets
+        return small_targets or corner_targets
+    if big_targets and not owned_bigs:
+        return big_targets
+    return small_targets + big_targets if (small_targets or big_targets) else corner_targets
 
 
-def _nearest_unconquered_targets(source, player, planets, claimed_target_ids):
-    candidates = [p for p in planets if int(p.owner) != player and p.id not in claimed_target_ids]
+def _pre_establishment_expansion_targets(source, player, planets, claimed_target_ids):
+    candidates = [
+        p
+        for p in planets
+        if int(p.owner) == NEUTRAL
+        and p.id not in claimed_target_ids
+        and p.id != int(source.id)
+    ]
     if not candidates:
         return []
 
     source_quadrant = _quadrant(source)
-    establishment_targets = _needed_establishment_targets(planets, player, source_quadrant, claimed_target_ids)
-    if establishment_targets:
-        candidates = establishment_targets
-    elif not _established_for(planets, player, source_quadrant):
+
+    def score(target):
+        target_quadrant = _quadrant(target)
+        return (
+            target_quadrant != source_quadrant,
+            _quadrant_distance(source_quadrant, target_quadrant),
+            0 if _same_equator_side(source, target) else 1,
+            int(target.ships),
+            _distance(source, target),
+            _distance_to_quadrant_corner(target, target_quadrant),
+            -int(target.production),
+            -float(target.radius),
+        )
+
+    return sorted(candidates, key=score)
+
+
+def _pre_establishment_expansion(state, player, planets, fleets, moves, reserved, angular_velocity, step):
+    claimed_target_ids = _claimed_target_ids(state, player, planets, fleets)
+    sources = sorted(
+        [p for p in planets if int(p.owner) == player and _available(p, reserved) > 0],
+        key=lambda p: (-_available(p, reserved), _quadrant(p), _distance_to_center(p)),
+    )
+    for source in sources:
+        candidates = _pre_establishment_expansion_targets(source, player, planets, claimed_target_ids)
+        candidates = _rerank_targets_with_model(
+            state,
+            player,
+            planets,
+            fleets,
+            angular_velocity,
+            step,
+            source,
+            candidates,
+        )
+        for target in candidates[:16]:
+            need = _planned_capture_need(source, target, angular_velocity)
+            if _available(source, reserved) < need:
+                continue
+            if _send_expansion_payload(
+                state,
+                source,
+                target,
+                moves,
+                reserved,
+                angular_velocity,
+                need=need,
+                require_attack_ready=False,
+                planets=planets,
+            ):
+                claimed_target_ids.add(target.id)
+                break
+
+
+def _attacker_stage_action(
+    state,
+    player,
+    planets,
+    fleets,
+    moves,
+    reserved,
+    angular_velocity,
+    step,
+    primary_anchor_id=None,
+):
+    claimed_target_ids = _claimed_target_ids(state, player, planets, fleets)
+    target_quadrant, attacker = _sync_attacker_stage(
+        state,
+        player,
+        planets,
+        reserved,
+        claimed_target_ids,
+        primary_anchor_id=primary_anchor_id,
+    )
+    if attacker is None or target_quadrant is None:
+        return
+
+    available = _available(attacker, reserved)
+    if available <= 0:
+        return
+
+    targets = _attack_quadrant_targets(planets, player, target_quadrant, claimed_target_ids)
+    if not targets:
+        return
+
+    if _quadrant(attacker) != target_quadrant and available < _attacker_stage_goal(attacker, target_quadrant):
+        return
+
+    ranked_targets = _rerank_targets_with_model(
+        state,
+        player,
+        planets,
+        fleets,
+        angular_velocity,
+        step,
+        attacker,
+        targets,
+    )
+    for target in ranked_targets[:12]:
+        need = (
+            _offensive_capture_need(attacker, target, player, planets, fleets, angular_velocity)
+            if int(target.owner) not in (player, NEUTRAL)
+            else _planned_capture_need(attacker, target, angular_velocity)
+        )
+        if available < need:
+            continue
+        if int(target.owner) == NEUTRAL and _should_stagger_establishment_capture(attacker, target, player, planets, need):
+            if _send_staggered_payload(
+                state,
+                attacker,
+                target,
+                moves,
+                reserved,
+                angular_velocity,
+                need=need,
+                planets=planets,
+            ):
+                return
+        elif _send_expansion_payload(
+            state,
+            attacker,
+            target,
+            moves,
+            reserved,
+            angular_velocity,
+            need=need,
+            require_attack_ready=False,
+            planets=planets,
+        ):
+            return
+
+
+def _recent_static_focus_targets(state, player, planets, fleets, claimed_target_ids, angular_velocity, step):
+    focus, focus_quadrant = _recent_static_focus(state, player, planets)
+    if focus is None:
+        return []
+
+    quadrant_targets = [
+        p
+        for p in planets
+        if int(p.owner) != player and _quadrant(p) == focus_quadrant
+    ]
+    if not quadrant_targets:
+        state["recent_static_capture_id"] = None
+        state["recent_static_capture_quadrant"] = None
+        return []
+
+    candidates = [p for p in quadrant_targets if p.id not in claimed_target_ids]
+    def score(p):
+        profile = _planet_profile(p, player=player, planets=planets)
+        return (
+            "easy" not in profile.labels,
+            "neutral" not in profile.labels,
+            int(p.ships),
+            -int(p.production),
+            -float(p.radius),
+            _distance(focus, p),
+            profile.corner_distance,
+        )
+
+    ranked = sorted(candidates, key=score)
+    return _rerank_targets_with_model(state, player, planets, fleets, angular_velocity, step, focus, ranked)
+
+
+def _serious_attack_targets(state, source, player, planets, fleets, reserved, claimed_target_ids, angular_velocity, step):
+    available = _available(source, reserved)
+    if available < ATTACK_MIN_FRONTLINE_SHIPS and not _is_large_production(source):
+        return []
+
+    source_quadrant = _quadrant(source)
+    attacker_id = state.get("attacker_planet_id")
+    control_half = _current_control_half(state, player, planets, fleets=fleets, claimed_target_ids=claimed_target_ids)
+    established_quadrants = _operationally_established_quadrants(planets, player)
+    source_established = source_quadrant in established_quadrants
+    candidates = [
+        p
+        for p in planets
+        if int(p.owner) not in (player, NEUTRAL)
+        and p.id not in claimed_target_ids
+        and _same_equator_side(source, p)
+        and (_quadrant_distance(source_quadrant, _quadrant(p)) <= 1 or available >= 44)
+    ]
+    if not candidates:
+        return []
+
+    if control_half:
+        if source.id == attacker_id:
+            candidates = [p for p in candidates if _quadrant(p) in control_half]
+        else:
+            candidates = [p for p in candidates if _quadrant(p) == source_quadrant]
+        if not candidates:
+            return []
+
+    if not source_established:
+        same_quadrant = [p for p in candidates if _quadrant(p) == source_quadrant]
+        if same_quadrant:
+            candidates = same_quadrant
+
+    ranked = []
+    for target in candidates:
+        need = _offensive_capture_need(source, target, player, planets, fleets, angular_velocity)
+        if need > available:
+            continue
+        friendly_support, enemy_support = _local_support_totals(player, target, planets, fleets=fleets)
+        support_gap = friendly_support - enemy_support
+        target_quadrant = _quadrant(target)
+        our_quadrant_total, enemy_quadrant_total = _quadrant_totals(player, target_quadrant, planets, fleets=fleets)
+        quadrant_gap = our_quadrant_total - enemy_quadrant_total
+        distance = _distance(source, target)
+        need_ratio = need / max(1.0, float(available))
+        enemy_established = _enemy_established(planets, int(target.owner), target_quadrant)
+
+        score = 0.0
+        score += 52.0
+        score += 15.0 * float(target.production)
+        score += 14.0 if _is_big(target) else 4.0
+        score += 8.0 if _is_static(target) else 2.0
+        score += 10.0 if target_quadrant == source_quadrant else 4.0
+        score += 12.0 if enemy_established else 0.0
+        score += 0.22 * support_gap
+        score += 0.08 * quadrant_gap
+        score += 0.35 * max(0, available - need)
+        score -= 1.15 * distance
+        score -= 34.0 * need_ratio
+        score -= 0.55 * int(target.ships)
+
+        if not source_established and support_gap < 0 and not _is_big(target):
+            continue
+        if available - need < 0:
+            continue
+        ranked.append((score, target, need))
+
+    if not ranked:
+        return []
+
+    ranked.sort(key=lambda item: (-item[0], item[2], _distance(source, item[1])))
+    ranked_targets = [target for _, target, _ in ranked]
+    ranked_targets = _rerank_targets_with_model(state, player, planets, fleets, angular_velocity, step, source, ranked_targets)
+    need_by_id = {target.id: need for _, target, need in ranked}
+    return [(target, need_by_id[target.id]) for target in ranked_targets if target.id in need_by_id]
+
+
+def _established_static_assault_targets(
+    state,
+    source,
+    player,
+    planets,
+    fleets,
+    reserved,
+    claimed_target_ids,
+    angular_velocity,
+    step,
+):
+    source_quadrant = _quadrant(source)
+    if not _operationally_established_for(planets, player, source_quadrant):
+        return []
+
+    available = _available(source, reserved)
+    if available < _attack_ready_ships(source):
+        return []
+
+    attacker_id = state.get("attacker_planet_id")
+    control_half = _current_control_half(state, player, planets, fleets=fleets, claimed_target_ids=claimed_target_ids)
+    ranked = []
+    for target in planets:
+        if int(target.owner) in (player, NEUTRAL):
+            continue
+        if not _is_static(target) or target.id in claimed_target_ids:
+            continue
+        if not _same_equator_side(source, target):
+            continue
+
+        target_quadrant = _quadrant(target)
+        if control_half and target_quadrant not in control_half:
+            continue
+        if source.id != attacker_id and target_quadrant != source_quadrant:
+            continue
+        quadrant_distance = _quadrant_distance(source_quadrant, target_quadrant)
+        if quadrant_distance > 1:
+            continue
+
+        distance = _distance(source, target)
+        distance_limit = ESTABLISHED_STATIC_ASSAULT_RADIUS if target_quadrant == source_quadrant else ATTACK_LONG_RANGE_RADIUS
+        if distance > distance_limit:
+            continue
+
+        need = _offensive_capture_need(source, target, player, planets, fleets, angular_velocity)
+        if need > available:
+            continue
+
+        friendly_support, enemy_support = _local_support_totals(player, target, planets, fleets=fleets)
+        support_gap = friendly_support - enemy_support
+        our_quadrant_total, enemy_quadrant_total = _quadrant_totals(player, target_quadrant, planets, fleets=fleets)
+        quadrant_gap = our_quadrant_total - enemy_quadrant_total
+        enemy_established = _enemy_established(planets, int(target.owner), target_quadrant)
+
+        score = 80.0
+        score += 22.0 if target_quadrant == source_quadrant else 11.0
+        score += 18.0 if _is_corner_node(target) else 0.0
+        score += 16.0 * float(target.production)
+        score += 8.0 if enemy_established else 0.0
+        score += 0.28 * support_gap
+        score += 0.12 * quadrant_gap
+        score += 0.40 * max(0, available - need)
+        score -= 1.45 * distance
+        score -= 0.80 * int(target.ships)
+
+        ranked.append((score, target, need))
+
+    if not ranked:
+        return []
+
+    ranked.sort(key=lambda item: (-item[0], item[2], _distance(source, item[1])))
+    ranked_targets = [target for _, target, _ in ranked]
+    ranked_targets = _rerank_targets_with_model(state, player, planets, fleets, angular_velocity, step, source, ranked_targets)
+    need_by_id = {target.id: need for _, target, need in ranked}
+    return [(target, need_by_id[target.id]) for target in ranked_targets if target.id in need_by_id]
+
+
+def _nearest_unconquered_targets(state, source, player, planets, fleets, claimed_target_ids, angular_velocity, step):
+    candidates = [
+        p
+        for p in planets
+        if int(p.owner) != player
+        and p.id not in claimed_target_ids
+        and _same_equator_side(source, p)
+    ]
+    if not candidates:
+        return []
+
+    source_quadrant = _quadrant(source)
+    attacker_id = state.get("attacker_planet_id")
+    control_half = _current_control_half(state, player, planets, fleets=fleets, claimed_target_ids=claimed_target_ids)
+    established_quadrants = _operationally_established_quadrants(planets, player)
+    source_established = source_quadrant in established_quadrants
+    focus_targets = _recent_static_focus_targets(state, player, planets, fleets, claimed_target_ids, angular_velocity, step)
+    focus_targets = _same_equator_targets(source, focus_targets)
+    if focus_targets and (source_established or _quadrant(focus_targets[0]) == source_quadrant):
+        return _rerank_targets_with_model(state, player, planets, fleets, angular_velocity, step, source, focus_targets)
+
+    if not source_established:
+        establishment_targets = _needed_establishment_targets(planets, player, source_quadrant, claimed_target_ids)
+        establishment_targets = _same_equator_targets(source, establishment_targets)
+        if establishment_targets:
+            candidates = establishment_targets
+        else:
+            same_quadrant_targets = [p for p in candidates if _quadrant(p) == source_quadrant]
+            if same_quadrant_targets:
+                candidates = same_quadrant_targets
+    else:
+        open_quadrant_set = set(_operationally_open_quadrants(planets, player))
+        if control_half:
+            open_quadrant_set &= set(control_half)
+        open_targets = [p for p in candidates if _quadrant(p) in open_quadrant_set]
+        if open_targets:
+            candidates = open_targets
+
+    if not candidates:
+        candidates = [
+            p
+            for p in planets
+            if int(p.owner) != player
+            and p.id not in claimed_target_ids
+            and _same_equator_side(source, p)
+        ]
+
+    if source_established and control_half:
+        if source.id == attacker_id:
+            candidates = [p for p in candidates if _quadrant(p) in control_half]
+        else:
+            candidates = [
+                p
+                for p in candidates
+                if _quadrant(p) in control_half and (int(p.owner) == NEUTRAL or _quadrant(p) == source_quadrant)
+            ]
+
+    if not source_established:
         same_quadrant_targets = [p for p in candidates if _quadrant(p) == source_quadrant]
         if same_quadrant_targets:
             candidates = same_quadrant_targets
 
-    return sorted(
-        candidates,
-        key=lambda p: (
-            int(p.owner) != NEUTRAL,
-            _distance(source, p),
+    def score(p):
+        profile = _planet_profile(p, player=player, planets=planets)
+        return (
+            _target_quadrant_rank(source_quadrant, profile.quadrant, established_quadrants),
+            "easy" not in profile.labels,
+            "neutral" not in profile.labels,
             int(p.ships),
-            _distance_to_quadrant_corner(p, _quadrant(p)),
-        ),
-    )
+            _distance(source, p),
+            -int(p.production),
+            profile.corner_distance,
+        )
+
+    ranked = sorted(candidates, key=score)
+    return _rerank_targets_with_model(state, player, planets, fleets, angular_velocity, step, source, ranked)
 
 
-def _expansion(state, player, planets, moves, reserved, roles, angular_velocity):
+def _expansion(state, player, planets, fleets, moves, reserved, roles, angular_velocity, step):
     role_ids = set(roles)
     my_planets = [p for p in planets if int(p.owner) == player]
     if len(my_planets) < 2:
@@ -703,18 +2941,30 @@ def _expansion(state, player, planets, moves, reserved, roles, angular_velocity)
 
     battery_anchor = _primary_anchor_in_battery_mode(state, player, planets)
     battery_anchor_id = battery_anchor.id if battery_anchor is not None else None
-    claimed_target_ids = {burst["target_id"] for burst in state.get("bursts", [])}
+    attacker_id = state.get("attacker_planet_id")
+    attacker_target_quadrant = state.get("attacker_target_quadrant")
+    claimed_target_ids = _claimed_target_ids(state, player, planets, fleets)
+    focus, focus_quadrant = _recent_static_focus(state, player, planets)
+    established_quadrants = _operationally_established_quadrants(planets, player)
+
+    def source_score(p):
+        quadrant = _quadrant(p)
+        return (
+            quadrant in established_quadrants,
+            focus is not None and quadrant != focus_quadrant,
+            _distance(p, focus) if focus is not None else 0.0,
+            _distance_to_quadrant_corner(p, quadrant),
+            -int(p.ships),
+        )
 
     for source in sorted(
         my_planets,
-        key=lambda p: (
-            _established_for(planets, player, _quadrant(p)),
-            _distance_to_quadrant_corner(p, _quadrant(p)),
-            -int(p.ships),
-        ),
+        key=source_score,
     ):
-        source_established = _established_for(planets, player, _quadrant(source))
+        source_established = _quadrant(source) in established_quadrants
         if source.id == battery_anchor_id:
+            continue
+        if source.id == attacker_id and attacker_target_quadrant in _operationally_open_quadrants(planets, player):
             continue
         if source.id in role_ids and source_established:
             continue
@@ -722,10 +2972,105 @@ def _expansion(state, player, planets, moves, reserved, roles, angular_velocity)
         if available <= 0:
             continue
 
-        candidates = _nearest_unconquered_targets(source, player, planets, claimed_target_ids)
-        for target in candidates[:6]:
-            need = max(int(target.ships) + 2, _capture_need(source, target, angular_velocity, base=int(target.ships) + 2))
-            if _send_expansion_payload(state, source, target, moves, reserved, angular_velocity, need=need):
+        if source_established:
+            assault_targets = _established_static_assault_targets(
+                state,
+                source,
+                player,
+                planets,
+                fleets,
+                reserved,
+                claimed_target_ids,
+                angular_velocity,
+                step,
+            )
+            assaulted = False
+            for target, need in assault_targets[:8]:
+                if _send_expansion_payload(
+                    state,
+                    source,
+                    target,
+                    moves,
+                    reserved,
+                    angular_velocity,
+                    need=need,
+                    require_attack_ready=True,
+                    planets=planets,
+                ):
+                    claimed_target_ids.add(target.id)
+                    assaulted = True
+                    break
+            if assaulted:
+                continue
+
+        candidates = _nearest_unconquered_targets(
+            state,
+            source,
+            player,
+            planets,
+            fleets,
+            claimed_target_ids,
+            angular_velocity,
+            step,
+        )
+        prefer_attack = source_established or (candidates and int(candidates[0].owner) != NEUTRAL)
+        if prefer_attack:
+            attack_candidates = _serious_attack_targets(
+                state,
+                source,
+                player,
+                planets,
+                fleets,
+                reserved,
+                claimed_target_ids,
+                angular_velocity,
+                step,
+            )
+            attacked = False
+            for target, need in attack_candidates[:8]:
+                if _send_expansion_payload(
+                    state,
+                    source,
+                    target,
+                    moves,
+                    reserved,
+                    angular_velocity,
+                    need=need,
+                    require_attack_ready=True,
+                    planets=planets,
+                ):
+                    claimed_target_ids.add(target.id)
+                    attacked = True
+                    break
+            if attacked:
+                continue
+
+        for target in candidates[:16]:
+            need = _planned_capture_need(source, target, angular_velocity)
+            if not source_established and _should_stagger_establishment_capture(source, target, player, planets, need):
+                if _send_staggered_payload(
+                    state,
+                    source,
+                    target,
+                    moves,
+                    reserved,
+                    angular_velocity,
+                    need=need,
+                    planets=planets,
+                ):
+                    claimed_target_ids.add(target.id)
+                    break
+            if _send_expansion_payload(
+                state,
+                source,
+                target,
+                moves,
+                reserved,
+                angular_velocity,
+                need=need,
+                require_attack_ready=True,
+                planets=planets,
+            ):
                 claimed_target_ids.add(target.id)
                 break
 
@@ -733,32 +3078,58 @@ def _expansion(state, player, planets, moves, reserved, roles, angular_velocity)
 def anchor_feeder_agent(obs, config=None):
     player, planets, fleets, angular_velocity, _ = _parse(obs)
     state = _state_for(player, obs)
+    state["turn_claimed_target_ids"] = set()
+    step = int(_obs_get(obs, "step", _obs_get(obs, "turn", 0)) or 0)
     moves = []
     reserved = {}
 
     if not planets:
         return moves
 
+    _update_tactical_events(state, player, planets)
+    _update_recent_static_capture_focus(state, player, planets)
     battery_anchor = _primary_anchor_in_battery_mode(state, player, planets)
     blocked_trap_ids = {battery_anchor.id} if battery_anchor is not None else set()
-    roles = _our_roles(planets, player)
+    roles = _our_roles(planets, player, fleets=fleets, state=state)
 
     _reactive_trap(player, planets, fleets, moves, reserved, blocked_source_ids=blocked_trap_ids)
     _drain_bursts(state, player, planets, moves, reserved, angular_velocity)
     _initiation_phase(state, player, planets, moves, reserved, angular_velocity)
     owned_count = sum(1 for p in planets if int(p.owner) == player)
     if owned_count < 2 and state.get("opening_target_ids"):
+        _unstick_opening_if_stalled(state, player, planets, fleets, moves, reserved, angular_velocity, step)
         return moves
     if owned_count < 2 and not state.get("opened") and len(state.get("opening_launched_ids", [])) < 2:
+        _unstick_opening_if_stalled(state, player, planets, fleets, moves, reserved, angular_velocity, step)
         return moves
 
-    roles = _our_roles(planets, player)
+    if not _operationally_any_established(planets, player):
+        _pre_establishment_expansion(state, player, planets, fleets, moves, reserved, angular_velocity, step)
+        return moves
+
+    roles = _our_roles(planets, player, fleets=fleets, state=state)
     _primary_anchor_action(state, player, planets, moves, reserved, angular_velocity)
     primary_anchor_id = state.get("primary_anchor_id")
-    _striker_mode(player, planets, moves, reserved, roles, angular_velocity, primary_anchor_id=primary_anchor_id)
-    _feeder_logic(player, planets, moves, reserved, angular_velocity)
-    _role_actions(player, planets, moves, reserved, roles, angular_velocity)
-    _expansion(state, player, planets, moves, reserved, roles, angular_velocity)
+    _attacker_stage_action(state, player, planets, fleets, moves, reserved, angular_velocity, step, primary_anchor_id=primary_anchor_id)
+    _striker_mode(state, player, planets, fleets, moves, reserved, roles, angular_velocity, step, primary_anchor_id=primary_anchor_id)
+    _feeder_logic(state, player, planets, fleets, moves, reserved, angular_velocity, step, primary_anchor_id=primary_anchor_id)
+    collector_id = state.get("static_collector_id")
+    collector_blocked_ids = {collector_id} if collector_id is not None else set()
+    _role_actions(state, player, planets, fleets, moves, reserved, roles, angular_velocity, step, blocked_source_ids=collector_blocked_ids)
+    _expansion(state, player, planets, fleets, moves, reserved, roles, angular_velocity, step)
+    if not moves:
+        _force_nearest_unconquered_move(
+            state,
+            player,
+            planets,
+            fleets,
+            moves,
+            reserved,
+            angular_velocity,
+            step,
+            min_ships=OPENING_STALL_SHIPS,
+            require_attack_ready=True,
+        )
 
     return moves
 
