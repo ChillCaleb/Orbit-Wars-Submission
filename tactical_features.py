@@ -76,6 +76,14 @@ PHASE_NAMES = (
     "attack",
 )
 
+TREND_NAMES = (
+    "chasing_leader",
+    "pressured",
+    "overtake_window",
+    "cash_in",
+    "neutral",
+)
+
 ACTION_FEATURE_SCALES = {
     "source_ships": 160.0,
     "source_prod": 5.0,
@@ -1119,6 +1127,33 @@ def overtake_profile_for_target(planets, fleets, player, target, owner_scores=No
     }
 
 
+def trend_identity_for_target(planets, fleets, player, target, owner_scores=None, player_count=None, tendency=None):
+    player = int(player)
+    overtake_profile = overtake_profile_for_target(
+        planets,
+        fleets,
+        player,
+        target,
+        owner_scores=owner_scores,
+        player_count=player_count,
+    )
+    tendency = tendency or {}
+    captures = float(tendency.get("captures", 0))
+    losses = float(tendency.get("losses", 0))
+    launches = float(tendency.get("launches", 0))
+    aggression = captures + launches
+    pressure = losses - captures
+    if float(overtake_profile["overtake_bonus"]) >= 0.55:
+        return "overtake_window"
+    if pressure >= 2.0:
+        return "pressured"
+    if aggression >= 6.0 and float(overtake_profile["board_ownership_bonus"]) >= 0.35:
+        return "cash_in"
+    if float(overtake_profile["leader_target"]) > 0.0 or float(overtake_profile["ahead_owner_target"]) > 0.0:
+        return "chasing_leader"
+    return "neutral"
+
+
 def infer_role_assignments_from_state(
     planets,
     fleets,
@@ -1731,6 +1766,7 @@ def action_feature_vector_for_state(
     role_summary=None,
     owner_scores=None,
     overtake_profile=None,
+    trend_identity=None,
 ):
     if source is None or int(ships) <= 0:
         return []
@@ -1865,6 +1901,16 @@ def action_feature_vector_for_state(
             owner_scores=owner_scores,
             player_count=player_count,
         )
+    if trend_identity is None:
+        trend_identity = trend_identity_for_target(
+            planets,
+            fleets,
+            player,
+            target,
+            owner_scores=owner_scores,
+            player_count=player_count,
+            tendency=tendency,
+        )
 
     features = [
         float(step) / 500.0,
@@ -1961,6 +2007,7 @@ def action_feature_vector_for_state(
             float(overtake_profile["overtake_bonus"]),
         ]
     )
+    features.extend(_one_hot(trend_identity, TREND_NAMES))
     features.extend(
         [
             float(enemy_ships_total) / ACTION_FEATURE_SCALES["enemy_ships"],
@@ -2009,6 +2056,13 @@ def action_feature_vector(
     ships = int(action[2]) if action and len(action) >= 3 else 0
     step = int(obs_get(obs, "step", 0) or 0)
     angular_velocity = float(obs_get(obs, "angular_velocity", 0.0) or 0.0)
+    trend_identity = trend_identity_for_target(
+        planets,
+        fleets,
+        player,
+        target,
+        tendency=tendency,
+    )
     return action_feature_vector_for_state(
         planets,
         fleets,
@@ -2026,4 +2080,5 @@ def action_feature_vector(
         attacker_planet_id=attacker_planet_id,
         feeder_planet_id=feeder_planet_id,
         action_angle=float(action[1]) if action and len(action) >= 2 else None,
+        trend_identity=trend_identity,
     )

@@ -3,6 +3,11 @@ from collections import namedtuple
 from pathlib import Path
 
 try:
+    import agent_smith as _smith_controller
+except Exception:
+    _smith_controller = None
+
+try:
     import numpy as np
 except Exception:
     np = None
@@ -11,16 +16,20 @@ try:
     from tactical_features import (
         action_feature_vector_for_state as _tf_action_feature_vector_for_state,
         action_penalty_profile_for_state as _tf_action_penalty_profile_for_state,
+        infer_action_target as _tf_infer_action_target,
         infer_role_assignments_from_state as _tf_infer_roles,
         numeric_quadrant_array as _tf_numeric_quadrant_array,
         role_scores as _tf_role_scores,
+        trend_identity_for_target as _tf_trend_identity_for_target,
     )
 except Exception:
     _tf_action_feature_vector_for_state = None
     _tf_action_penalty_profile_for_state = None
+    _tf_infer_action_target = None
     _tf_infer_roles = None
     _tf_numeric_quadrant_array = None
     _tf_role_scores = None
+    _tf_trend_identity_for_target = None
 
 try:
     from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet, Planet
@@ -72,7 +81,7 @@ TACTICAL_FEATURE_SCALES = (
     16.0,
     1800.0,
 )
-TACTICAL_MODEL_TOP_K = 10
+TACTICAL_MODEL_TOP_K = 24
 ATTACK_SUPPORT_RADIUS = 18.0
 ATTACK_LONG_RANGE_RADIUS = 26.0
 ATTACK_MIN_FRONTLINE_SHIPS = 24
@@ -814,6 +823,9 @@ def _fresh_state():
         "recent_static_capture_id": None,
         "recent_static_capture_quadrant": None,
         "tactical_tendency": _empty_tactical_tendency(),
+        "controller_intent": None,
+        "controller_intent_until": -1,
+        "controller_intent_reason": "smith-native",
     }
 
 
@@ -1043,6 +1055,105 @@ def _tactical_tendency(state):
     return tendency
 
 
+def _smith_controller_intent(state, player, planets, fleets, step):
+    tendency = _tactical_tendency(state)
+    captures = int(tendency.get("captures", 0))
+    losses = int(tendency.get("losses", 0))
+
+    production_by_owner = {}
+    ships_by_owner = {}
+    fleet_ships_by_owner = {}
+    for planet in planets:
+        owner = int(planet.owner)
+        if owner < 0:
+            continue
+        production_by_owner[owner] = production_by_owner.get(owner, 0) + int(planet.production)
+        ships_by_owner[owner] = ships_by_owner.get(owner, 0) + int(planet.ships)
+    for fleet in fleets:
+        owner = int(fleet.owner)
+        if owner < 0:
+            continue
+        fleet_ships_by_owner[owner] = fleet_ships_by_owner.get(owner, 0) + int(fleet.ships)
+        ships_by_owner[owner] = ships_by_owner.get(owner, 0) + int(fleet.ships)
+
+    enemy_owners = [owner for owner in production_by_owner if owner != int(player)]
+    my_production = float(production_by_owner.get(int(player), 0))
+    enemy_production = float(max((production_by_owner.get(owner, 0) for owner in enemy_owners), default=0))
+    my_ships = float(ships_by_owner.get(int(player), 0))
+    enemy_ships = float(max((ships_by_owner.get(owner, 0) for owner in enemy_owners), default=0))
+    enemy_fleet_ships = float(sum(fleet_ships_by_owner.get(owner, 0) for owner in enemy_owners))
+    enemy_commitment = enemy_fleet_ships / max(1.0, sum(ships_by_owner.get(owner, 0) for owner in enemy_owners))
+
+    evidence = {"patient": 0.0, "opportunistic": 0.0, "pressure": 0.0}
+    reasons = []
+
+    if step < 14:
+        evidence["patient"] += 1.0
+        reasons.append("opening")
+    if enemy_production > my_production * 1.15:
+        evidence["pressure"] += 1.25
+        reasons.append("production-deficit")
+    elif my_production > enemy_production * 1.15 and my_production > 0:
+        evidence["opportunistic"] += 0.9
+        reasons.append("production-window")
+    if losses >= captures + 2:
+        evidence["pressure"] += 1.1
+        reasons.append("loss-trend")
+    if captures >= losses + 2:
+        evidence["opportunistic"] += 0.7
+        reasons.append("capture-trend")
+    if enemy_commitment >= 0.22:
+        evidence["pressure"] += 0.9
+        evidence["opportunistic"] += 0.35
+        reasons.append("enemy-committed")
+    if my_ships >= max(40.0, enemy_ships * 1.12):
+        evidence["opportunistic"] += 0.8
+        reasons.append("ship-window")
+
+    trend_counts = {}
+    if _tf_trend_identity_for_target is not None:
+        for target in planets:
+            if int(target.owner) == int(player):
+                continue
+            trend = _tf_trend_identity_for_target(
+                planets,
+                fleets,
+                player,
+                target,
+                tendency=tendency,
+            )
+            trend_counts[trend] = trend_counts.get(trend, 0) + 1
+    if trend_counts.get("overtake_window", 0):
+        evidence["opportunistic"] += 1.2
+        reasons.append("overtake-window")
+    if trend_counts.get("cash_in", 0):
+        evidence["opportunistic"] += 0.8
+        reasons.append("cash-in")
+    if trend_counts.get("pressured", 0):
+        evidence["pressure"] += 0.8
+    if trend_counts.get("chasing_leader", 0):
+        evidence["pressure"] += 0.45
+        evidence["opportunistic"] += 0.35
+        reasons.append("leader-target")
+
+    proposed, score = max(evidence.items(), key=lambda item: item[1])
+    if score < 1.15:
+        proposed = None
+
+    previous = state.get("controller_intent")
+    intent_until = int(state.get("controller_intent_until", -1))
+    if proposed is None and previous is not None and step <= intent_until:
+        proposed = previous
+    elif proposed is not None:
+        state["controller_intent"] = proposed
+        state["controller_intent_until"] = step + 4
+    else:
+        state["controller_intent"] = None
+
+    state["controller_intent_reason"] = ",".join(reasons) if reasons else "smith-native"
+    return proposed
+
+
 def _update_tactical_events(state, player, planets):
     tendency = _tactical_tendency(state)
     current_owner_by_planet = {int(p.id): int(p.owner) for p in planets}
@@ -1238,7 +1349,9 @@ def _predict_tactical_value(state, player, planets, fleets, angular_velocity, st
     vector = np.asarray(features, dtype=np.float32)
     logits = ((vector - model["mean"]) / model["std"]) @ model["weights"] + model["bias"]
     score = _sigmoid(float(logits))
-    return max(0.0, min(1.0, score * float(penalty_profile["quality_score"])))
+    # Keep the model's preference signal strong; the heuristic layers already
+    # guard against clearly unsafe launches.
+    return max(0.0, min(1.0, 0.75 * score + 0.25 * float(penalty_profile["quality_score"])))
 
 
 def _rerank_targets_with_model(state, player, planets, fleets, angular_velocity, step, source, candidates):
@@ -1247,7 +1360,8 @@ def _rerank_targets_with_model(state, player, planets, fleets, angular_velocity,
 
     candidates = _learning_focus_targets(state, player, planets, fleets, source, candidates)
     scored = []
-    for idx, target in enumerate(candidates[:TACTICAL_MODEL_TOP_K]):
+    limit = len(candidates) if len(candidates) <= 32 else TACTICAL_MODEL_TOP_K
+    for idx, target in enumerate(candidates[:limit]):
         need = _planned_capture_need(source, target, angular_velocity)
         score = _predict_tactical_value(state, player, planets, fleets, angular_velocity, step, source, target, need)
         if score is None:
@@ -2762,7 +2876,7 @@ def _serious_attack_targets(state, source, player, planets, fleets, reserved, cl
         score -= 34.0 * need_ratio
         score -= 0.55 * int(target.ships)
 
-        if not source_established and support_gap < 0 and not _is_big(target):
+        if not source_established and support_gap < -6 and not _is_big(target):
             continue
         if available - need < 0:
             continue
@@ -3134,8 +3248,27 @@ def anchor_feeder_agent(obs, config=None):
     return moves
 
 
+def smith_moveset_agent(obs, config=None):
+    if _smith_controller is None:
+        return anchor_feeder_agent(obs, config)
+
+    player, planets, fleets, _, _ = _parse(obs)
+    state = _state_for(player, obs)
+    step = int(_obs_get(obs, "step", _obs_get(obs, "turn", 0)) or 0)
+    _update_tactical_events(state, player, planets)
+    intent = _smith_controller_intent(state, player, planets, fleets, step)
+    moves = _smith_controller.controller_agent(obs, config=config, intent=intent)
+
+    if _tf_infer_action_target is not None:
+        for move in moves:
+            target = _tf_infer_action_target(move, planets)
+            if target is not None:
+                _record_tactical_move(state, player, target, int(move[2]))
+    return moves
+
+
 def agent(obs, config=None):
-    return anchor_feeder_agent(obs, config)
+    return smith_moveset_agent(obs, config)
 
 
-nearest_planet_sniper = anchor_feeder_agent
+nearest_planet_sniper = smith_moveset_agent

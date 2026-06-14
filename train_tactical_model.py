@@ -43,6 +43,7 @@ from tactical_features import (
     role_confidence_map_from_state,
     role_scores,
     same_equator_side,
+    trend_identity_for_target,
 )
 from watch_match import build_lineup
 
@@ -605,6 +606,15 @@ def game_samples(env, calls_by_step, labels, category, split, sample_stride, tra
                         "board_ownership_bonus": round(float(chosen_overtake["board_ownership_bonus"]), 6),
                         "projected_overtake_count": round(float(chosen_overtake["projected_overtake_count"]), 6),
                         "overtake_focus_weight": round(float(overtake_focus_weight), 6),
+                        "trend_identity": trend_identity_for_target(
+                            planets,
+                            fleets,
+                            player,
+                            candidate,
+                            owner_scores=owner_scores,
+                            player_count=player_count,
+                            tendency=tendencies[label],
+                        ),
                     }
                     rows.append(positive_row)
                     targets.append(1.0)
@@ -749,6 +759,7 @@ def collect_games(args, run_dir):
                 "board_ownership_bonus",
                 "projected_overtake_count",
                 "overtake_focus_weight",
+                "trend_identity",
             ],
         )
         values_writer = None
@@ -800,6 +811,7 @@ def collect_games(args, run_dir):
                         "board_ownership_bonus",
                         "projected_overtake_count",
                         "overtake_focus_weight",
+                        "trend_identity",
                         "group",
                     ]
                     + [f"f{idx}" for idx in range(len(result["rows"][0]))],

@@ -550,6 +550,33 @@ MODE_PARAMS_2P = {
     },
 }
 
+SMITH_MOVESET_ORDER = {
+    "patient": (
+        "cheap_pickup",
+        "expand",
+        "accumulator",
+        "mega_hammer",
+        "hammer",
+        "multiprong",
+    ),
+    "opportunistic": (
+        "cheap_pickup",
+        "hammer",
+        "expand",
+        "mega_hammer",
+        "multiprong",
+        "accumulator",
+    ),
+    "pressure": (
+        "mega_hammer",
+        "hammer",
+        "multiprong",
+        "expand",
+        "cheap_pickup",
+        "accumulator",
+    ),
+}
+
 
 
 
@@ -4708,15 +4735,22 @@ def _build_multiprong_attack(world, target, available, spent, target_locked):
 
 
 
-def plan_moves(world, deadline=None):
+def _apply_controller_intent(world, intent):
+    if intent not in SMITH_MOVESET_ORDER:
+        world.controller_intent = world.mode
+        return
+    world.native_mode = world.mode
+    world.mode = intent
+    params_table = MODE_PARAMS_2P if world.is_2p else MODE_PARAMS
+    world.mode_params = params_table[intent]
+    world.controller_intent = intent
+
+
+def plan_moves(world, deadline=None, intent=None):
     global _planet_idle_counts, _promoted_stockpiles, _pending_commitments
 
-    
-    
-    
-    
-    
-    
+    _apply_controller_intent(world, intent)
+
     def _commitment_viable(c):
         if c["arrival_abs"] <= world.step:
             return False
@@ -4732,7 +4766,6 @@ def plan_moves(world, deadline=None):
         return True
     _pending_commitments[:] = [c for c in _pending_commitments if _commitment_viable(c)]
 
-    
     _update_neutral_watchlist(world)
 
     moves = []
@@ -4740,7 +4773,6 @@ def plan_moves(world, deadline=None):
     target_locked = set()
     mode_log = {}
 
-    
     rescue_needs = {}
     available = {}
     for p in world.my_planets:
@@ -4755,61 +4787,51 @@ def plan_moves(world, deadline=None):
         elif arrivals:
             mode_log[p.id] = "absorb"
 
-    
-    
-    
     def _over_budget():
         return deadline is not None and time.perf_counter() >= deadline
 
-    
-    
-    
+    # Safety options are interrupts. Tactical intent can reorder the remaining
+    # repertoire, but it cannot suppress evacuation, defense, or lead reserves.
     handle_comet_evac(world, available, spent, target_locked, moves, mode_log)
-
-    
-    handle_defense(world, rescue_needs, available, spent, target_locked,
-                   moves, mode_log)
-
-    
-    
-    
-    
+    handle_defense(
+        world,
+        rescue_needs,
+        available,
+        spent,
+        target_locked,
+        moves,
+        mode_log,
+    )
     _brain_reserve_lead(world, available, spent, mode_log)
 
-    
-    
-    if not _over_budget():
-        if not (SEARCH_EXPAND_4P_ENABLED and not world.is_2p
-                and SEARCH_DISABLES_CHEAP_PICKUP):
-            handle_cheap_pickup(world, available, spent, target_locked, moves, mode_log)
+    def _cheap_pickup():
+        if SEARCH_EXPAND_4P_ENABLED and not world.is_2p and SEARCH_DISABLES_CHEAP_PICKUP:
+            return
+        handle_cheap_pickup(world, available, spent, target_locked, moves, mode_log)
 
-    
-    if not _over_budget():
-        handle_expand(world, available, spent, target_locked, moves, mode_log)
+    tactical_options = {
+        "cheap_pickup": _cheap_pickup,
+        "expand": lambda: handle_expand(
+            world, available, spent, target_locked, moves, mode_log
+        ),
+        "accumulator": lambda: handle_accumulator(
+            world, available, spent, target_locked, moves, mode_log
+        ),
+        "mega_hammer": lambda: handle_mega_hammer(
+            world, available, spent, target_locked, moves, mode_log
+        ),
+        "hammer": lambda: handle_hammer(
+            world, available, spent, target_locked, moves, mode_log
+        ),
+        "multiprong": lambda: handle_multiprong(
+            world, available, spent, target_locked, moves, mode_log
+        ),
+    }
+    for option_name in SMITH_MOVESET_ORDER[world.controller_intent]:
+        if _over_budget():
+            break
+        tactical_options[option_name]()
 
-    
-    
-    
-    
-    if not _over_budget():
-        handle_accumulator(world, available, spent, target_locked, moves, mode_log)
-
-    
-    
-    if not _over_budget():
-        handle_mega_hammer(world, available, spent, target_locked, moves, mode_log)
-
-    
-    if not _over_budget():
-        handle_hammer(world, available, spent, target_locked, moves, mode_log)
-
-    
-    if not _over_budget():
-        handle_multiprong(world, available, spent, target_locked, moves, mode_log)
-
-    
-
-    
     for p in world.my_planets:
         if mode_log.get(p.id) and "absorb" not in mode_log[p.id]:
             _planet_idle_counts[p.id] = 0
@@ -4821,11 +4843,7 @@ def plan_moves(world, deadline=None):
     return moves
 
 
-
-
-
-
-def agent(obs, config=None):
+def controller_agent(obs, config=None, intent=None):
     global _agent_step, _hammer_plan, _planet_idle_counts, _promoted_stockpiles, _pending_commitments
     global _game_num_players, _2p_patient_streak, _2p_prod_share_history
 
@@ -4854,7 +4872,6 @@ def agent(obs, config=None):
     if not world.my_planets:
         return []
 
-    
     if not world.is_2p:
         _update_opp_profile_4p(world)
 
@@ -4862,7 +4879,18 @@ def agent(obs, config=None):
     soft_budget = max(0.5, act_timeout * SOFT_DEADLINE_FRACTION)
     deadline = start + soft_budget
 
-    return plan_moves(world, deadline=deadline)
+    return plan_moves(world, deadline=deadline, intent=intent)
 
 
-__all__ = ["agent", "Planet", "Fleet"]
+def agent(obs, config=None):
+    return controller_agent(obs, config=config)
+
+
+__all__ = [
+    "agent",
+    "controller_agent",
+    "plan_moves",
+    "SMITH_MOVESET_ORDER",
+    "Planet",
+    "Fleet",
+]
