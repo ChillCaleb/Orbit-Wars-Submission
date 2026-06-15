@@ -22,19 +22,19 @@ The goal is not to replace the controller yet. The goal is to record useful game
   - Wraps each agent so every action is recorded
   - Writes per-turn JSONL records, summaries, reports, and progression rows
 
-- `LAB/progression.csv`
+- `data/lab/progression.csv`
   - Long-term tendency/progression table across runs
 
-- `LAB/<run_id>/tendency_report.md`
+- `data/lab/<run_id>/tendency_report.md`
   - Human-readable tendency report for one run
 
-- `LAB/<run_id>/summary.json`
+- `data/lab/<run_id>/summary.json`
   - Machine-readable aggregate summary
 
-- `LAB/<run_id>/game_###.jsonl`
+- `data/lab/<run_id>/game_###.jsonl`
   - Per-turn tactical records
 
-- `LAB/<run_id>/weights_snapshot.json`
+- `data/lab/<run_id>/weights_snapshot.json`
   - Label weights used for that run
 
 ## Commands
@@ -42,31 +42,31 @@ The goal is not to replace the controller yet. The goal is to record useful game
 Run yours against the 1200 strategy and record data:
 
 ```bash
-.venv312/bin/python agent_lab.py --players mine 1200 --games 10 --seed 20260650
+python agent_lab.py --players mine 1200 --games 10 --seed 20260650
 ```
 
 Run Smith against 1039:
 
 ```bash
-.venv312/bin/python agent_lab.py --players smith 1039 --games 10 --seed 20260700
+python agent_lab.py --players smith 1039 --games 10 --seed 20260700
 ```
 
 Run the 4-player mix:
 
 ```bash
-.venv312/bin/python agent_lab.py --players mine smith 1039 1200 --games 5 --seed 20260800
+python agent_lab.py --players mine smith 1039 1200 --games 5 --seed 20260800
 ```
 
 Save the full board in every JSONL row for heavier training data:
 
 ```bash
-.venv312/bin/python agent_lab.py --players mine 1200 --games 20 --seed 20260900 --full-board
+python agent_lab.py --players mine 1200 --games 20 --seed 20260900 --full-board
 ```
 
 Skip per-turn JSONL files when you only want progression stats:
 
 ```bash
-.venv312/bin/python agent_lab.py --players smith 1039 --games 25 --seed 20261000 --no-records
+python agent_lab.py --players smith 1039 --games 25 --seed 20261000 --no-records
 ```
 
 ## Current Label Weights

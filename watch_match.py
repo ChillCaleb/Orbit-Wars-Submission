@@ -13,18 +13,22 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 ROOT = Path(__file__).resolve().parent
-VIDEO_DIR = ROOT / "MP4"
+VIDEO_DIR = ROOT / "data" / "replays"
 
 BUILTIN_AGENTS = {"random", "starter"}
 LOCAL_AGENT_ALIASES = {
     "mine": "main.py",
     "main": "main.py",
-    "smith": "agent_smith.py",
-    "agent_smith": "agent_smith.py",
-    "1039": "agent_1039_launch_safety.py",
-    "safety": "agent_1039_launch_safety.py",
-    "1200": "agent_1200_ppo_strategy.py",
-    "ppo": "agent_1200_ppo_strategy.py",
+    "smith": "agents/agent_smith.py",
+    "agent_smith": "agents/agent_smith.py",
+    "1039": "agents/agent_1039_launch_safety.py",
+    "safety": "agents/agent_1039_launch_safety.py",
+    "1200": "agents/agent_1200_ppo_strategy.py",
+    "ppo": "agents/agent_1200_ppo_strategy.py",
+    "best": "agents/best_orbit/agent_best_orbit.py",
+    "best_orbit": "agents/best_orbit/agent_best_orbit.py",
+    "intruder": "agents/light_intruder/agent_light_intruder.py",
+    "light_intruder": "agents/light_intruder/agent_light_intruder.py",
 }
 
 COLORS = {

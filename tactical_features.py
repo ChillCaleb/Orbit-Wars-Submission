@@ -84,6 +84,18 @@ TREND_NAMES = (
     "neutral",
 )
 
+PRESSURE_ARRIVAL_WINDOW = 9.0
+PRESSURE_MIN_SOURCE_COUNT = 2
+PRESSURE_MIN_DEFENSE_RATIO = 0.45
+PRESSURE_MIN_HOSTILE_SHIPS = 10
+PRESSURE_ACTION_FEATURE_NAMES = (
+    "pressure_direct_reinforcement",
+    "pressure_arrival_slack",
+    "pressure_need_coverage",
+    "pressure_source_drain",
+    "pressure_counter_source",
+)
+
 ACTION_FEATURE_SCALES = {
     "source_ships": 160.0,
     "source_prod": 5.0,
@@ -815,6 +827,206 @@ def infer_action_target(action, planets):
     return fallback[1] if fallback else None
 
 
+def _fleet_target_estimate(fleet, planets):
+    best = None
+    fallback = None
+    for planet in planets:
+        if int(planet.id) == int(fleet.from_planet_id):
+            continue
+        hit = _ray_circle_hit(
+            float(fleet.x),
+            float(fleet.y),
+            float(fleet.angle),
+            float(planet.x),
+            float(planet.y),
+            float(planet.radius),
+        )
+        if hit is not None:
+            if best is None or hit < best[0]:
+                best = (hit, planet)
+            continue
+
+        to_x = float(planet.x) - float(fleet.x)
+        to_y = float(planet.y) - float(fleet.y)
+        along = to_x * math.cos(float(fleet.angle)) + to_y * math.sin(float(fleet.angle))
+        if along <= 0.0:
+            continue
+        aim_angle = math.atan2(to_y, to_x)
+        angle_gap = _angle_delta(float(fleet.angle), aim_angle)
+        cross_track = abs(
+            to_x * math.sin(float(fleet.angle)) - to_y * math.cos(float(fleet.angle))
+        )
+        if angle_gap > 0.22 or cross_track > max(float(planet.radius) + 7.0, 10.0):
+            continue
+        score = angle_gap * 25.0 + cross_track / max(float(planet.radius), 1.0)
+        if fallback is None or score < fallback[0]:
+            fallback = (score, along, planet)
+
+    if best is not None:
+        travel_distance, target = best
+    elif fallback is not None:
+        _, along, target = fallback
+        travel_distance = max(0.0, along - float(target.radius))
+    else:
+        return None, None
+    eta = travel_distance / max(1.0, fleet_speed(int(fleet.ships)))
+    return target, max(1.0, eta)
+
+
+def concentrated_pressure_profile(planets, fleets, player):
+    player = int(player)
+    owned = [planet for planet in planets if int(planet.owner) == player]
+    empty = {
+        "flagged": False,
+        "reason": "none",
+        "target_id": None,
+        "quadrant": None,
+        "source_ids": (),
+        "source_count": 0,
+        "fleet_count": 0,
+        "hostile_ships": 0,
+        "projected_defense": 0.0,
+        "defense_ratio": 0.0,
+        "first_eta": 0.0,
+        "last_eta": 0.0,
+        "eta_spread": 0.0,
+    }
+    if not owned:
+        return empty
+
+    hostile_by_target = defaultdict(list)
+    friendly_by_target = defaultdict(list)
+    for fleet in fleets:
+        if int(fleet.owner) < 0:
+            continue
+        target, eta = _fleet_target_estimate(fleet, planets)
+        if target is None or int(target.owner) != player:
+            continue
+        row = (float(eta), int(fleet.from_planet_id), int(fleet.ships), int(fleet.owner))
+        if int(fleet.owner) == player:
+            friendly_by_target[int(target.id)].append(row)
+        else:
+            hostile_by_target[int(target.id)].append(row)
+
+    strongest = None
+    for target in owned:
+        arrivals = sorted(hostile_by_target.get(int(target.id), []))
+        for start in range(len(arrivals)):
+            window = [
+                row
+                for row in arrivals[start:]
+                if float(row[0]) - float(arrivals[start][0]) <= PRESSURE_ARRIVAL_WINDOW
+            ]
+            source_ids = {row[1] for row in window if row[1] >= 0}
+            if len(source_ids) < PRESSURE_MIN_SOURCE_COUNT:
+                continue
+
+            first_eta = float(window[0][0])
+            last_eta = float(window[-1][0])
+            hostile_ships = sum(int(row[2]) for row in window)
+            friendly_ships = sum(
+                int(row[2])
+                for row in friendly_by_target.get(int(target.id), [])
+                if float(row[0]) <= last_eta
+            )
+            projected_defense = (
+                float(target.ships)
+                + float(target.production) * math.ceil(last_eta)
+                + float(friendly_ships)
+            )
+            defense_ratio = float(hostile_ships) / max(1.0, projected_defense)
+            meaningful_mass = hostile_ships >= max(
+                PRESSURE_MIN_HOSTILE_SHIPS,
+                int(math.ceil(projected_defense * PRESSURE_MIN_DEFENSE_RATIO)),
+            )
+            if not meaningful_mass:
+                continue
+
+            profile = {
+                "flagged": True,
+                "reason": "concentrated_inbound",
+                "target_id": int(target.id),
+                "quadrant": quadrant_name(quadrant_index(target)),
+                "source_ids": tuple(sorted(source_ids)),
+                "source_count": len(source_ids),
+                "fleet_count": len(window),
+                "hostile_ships": int(hostile_ships),
+                "projected_defense": round(projected_defense, 3),
+                "defense_ratio": round(defense_ratio, 4),
+                "first_eta": round(first_eta, 3),
+                "last_eta": round(last_eta, 3),
+                "eta_spread": round(last_eta - first_eta, 3),
+            }
+            score = (
+                float(profile["source_count"]),
+                min(2.0, defense_ratio),
+                float(target.production),
+                float(hostile_ships),
+            )
+            if strongest is None or score > strongest[0]:
+                strongest = (score, profile)
+
+    return strongest[1] if strongest is not None else empty
+
+
+def pressure_conditioned_action_profile(
+    planets,
+    fleets,
+    player,
+    source,
+    target,
+    ships,
+    action_eta=None,
+    pressure_profile=None,
+):
+    pressure = pressure_profile or concentrated_pressure_profile(planets, fleets, player)
+    empty = {
+        "pressure_direct_reinforcement": 0.0,
+        "pressure_arrival_slack": 0.0,
+        "pressure_need_coverage": 0.0,
+        "pressure_source_drain": 0.0,
+        "pressure_counter_source": 0.0,
+    }
+    if not pressure["flagged"] or source is None or target is None or int(ships) <= 0:
+        return empty
+
+    pressure_target_id = int(pressure["target_id"])
+    direct_reinforcement = int(target.id) == pressure_target_id
+    source_drain = int(source.id) == pressure_target_id
+    counter_source = int(target.id) in set(pressure.get("source_ids", ()))
+
+    if action_eta is None:
+        travel_distance = max(
+            0.0,
+            distance(source, target) - float(source.radius) - float(target.radius),
+        )
+        action_eta = travel_distance / max(1.0, fleet_speed(int(ships)))
+
+    arrival_slack = 0.0
+    need_coverage = 0.0
+    if direct_reinforcement:
+        final_pressure_eta = max(1.0, float(pressure["last_eta"]))
+        arrival_slack = clamp(
+            (final_pressure_eta - float(action_eta) + 1.0) / final_pressure_eta
+        )
+        projected_gap = max(
+            1.0,
+            float(pressure["hostile_ships"])
+            - float(pressure["projected_defense"])
+            + 1.0,
+            math.ceil(float(pressure["hostile_ships"]) * 0.15),
+        )
+        need_coverage = clamp(float(ships) / projected_gap)
+
+    return {
+        "pressure_direct_reinforcement": 1.0 if direct_reinforcement else 0.0,
+        "pressure_arrival_slack": arrival_slack,
+        "pressure_need_coverage": need_coverage,
+        "pressure_source_drain": 1.0 if source_drain else 0.0,
+        "pressure_counter_source": 1.0 if counter_source else 0.0,
+    }
+
+
 def action_features(action, obs, player=None):
     planets = planets_from_obs(obs)
     player = player_from_obs(obs) if player is None else int(player)
@@ -1127,7 +1339,15 @@ def overtake_profile_for_target(planets, fleets, player, target, owner_scores=No
     }
 
 
-def trend_identity_for_target(planets, fleets, player, target, owner_scores=None, player_count=None, tendency=None):
+def trend_identity_details_for_target(
+    planets,
+    fleets,
+    player,
+    target,
+    owner_scores=None,
+    player_count=None,
+    tendency=None,
+):
     player = int(player)
     overtake_profile = overtake_profile_for_target(
         planets,
@@ -1143,15 +1363,34 @@ def trend_identity_for_target(planets, fleets, player, target, owner_scores=None
     launches = float(tendency.get("launches", 0))
     aggression = captures + launches
     pressure = losses - captures
+    concentrated = concentrated_pressure_profile(planets, fleets, player)
+    if concentrated["flagged"]:
+        return {
+            **concentrated,
+            "identity": "pressured",
+            "reason": concentrated["reason"],
+        }
     if float(overtake_profile["overtake_bonus"]) >= 0.55:
-        return "overtake_window"
+        return {**concentrated, "identity": "overtake_window", "reason": "overtake_window"}
     if pressure >= 2.0:
-        return "pressured"
+        return {**concentrated, "identity": "pressured", "reason": "loss_trend"}
     if aggression >= 6.0 and float(overtake_profile["board_ownership_bonus"]) >= 0.35:
-        return "cash_in"
+        return {**concentrated, "identity": "cash_in", "reason": "cash_in"}
     if float(overtake_profile["leader_target"]) > 0.0 or float(overtake_profile["ahead_owner_target"]) > 0.0:
-        return "chasing_leader"
-    return "neutral"
+        return {**concentrated, "identity": "chasing_leader", "reason": "leader_target"}
+    return {**concentrated, "identity": "neutral", "reason": "neutral"}
+
+
+def trend_identity_for_target(planets, fleets, player, target, owner_scores=None, player_count=None, tendency=None):
+    return trend_identity_details_for_target(
+        planets,
+        fleets,
+        player,
+        target,
+        owner_scores=owner_scores,
+        player_count=player_count,
+        tendency=tendency,
+    )["identity"]
 
 
 def infer_role_assignments_from_state(
@@ -1911,6 +2150,17 @@ def action_feature_vector_for_state(
             player_count=player_count,
             tendency=tendency,
         )
+    concentrated_pressure = concentrated_pressure_profile(planets, fleets, player)
+    pressure_action = pressure_conditioned_action_profile(
+        planets,
+        fleets,
+        player,
+        source,
+        target,
+        ships,
+        action_eta=penalty_profile["eta"],
+        pressure_profile=concentrated_pressure,
+    )
 
     features = [
         float(step) / 500.0,
@@ -2033,6 +2283,9 @@ def action_feature_vector_for_state(
             float(penalty_profile["long_flight_penalty"]),
             float(penalty_profile["opportunity_penalty"]),
         ]
+    )
+    features.extend(
+        [float(pressure_action[name]) for name in PRESSURE_ACTION_FEATURE_NAMES]
     )
     return features
 

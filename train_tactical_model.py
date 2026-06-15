@@ -39,31 +39,37 @@ from tactical_features import (
     overtake_profile_for_target,
     owner_control_scores,
     planets_from_obs,
+    concentrated_pressure_profile,
     quadrant_index,
     role_confidence_map_from_state,
     role_scores,
     same_equator_side,
-    trend_identity_for_target,
+    trend_identity_details_for_target,
 )
 from watch_match import build_lineup
 
 
 ROOT = Path(__file__).resolve().parent
-TRAIN_DIR = ROOT / "TRAINING_RUNS"
+TRAIN_DIR = ROOT / "data" / "training_runs"
+LEGACY_TRAIN_DIR = ROOT / "TRAINING_RUNS"
 TOTAL_STEPS = 500.0
 
 WITH_MINE_LINEUPS = (
     ("mine", "1200"),
     ("mine", "smith"),
     ("mine", "1039"),
-    ("mine", "smith", "1039", "1200"),
+    ("mine", "best"),
+    ("mine", "intruder"),
+    ("mine", "smith", "best", "intruder"),
 )
 
 WITHOUT_MINE_LINEUPS = (
     ("smith", "1039"),
     ("smith", "1200"),
     ("1039", "1200"),
-    ("smith", "1039", "1200", "random"),
+    ("best", "smith"),
+    ("intruder", "1039"),
+    ("best", "intruder", "smith", "1039"),
 )
 
 WORKER_LINEUP_CACHE = {}
@@ -312,7 +318,19 @@ def _shortlist_ranking_candidates(planets, fleets, player, source, chosen_target
         and int(planet.owner) != int(player)
         and same_equator_side(source, planet)
     ]
-    if not candidates:
+    pressure = concentrated_pressure_profile(planets, fleets, player)
+    pressure_target = None
+    if pressure["flagged"]:
+        pressure_target = next(
+            (
+                planet
+                for planet in planets
+                if int(planet.id) == int(pressure["target_id"])
+                and int(planet.id) != int(source.id)
+            ),
+            None,
+        )
+    if not candidates and pressure_target is None:
         return []
 
     control_half = current_control_half(planets, fleets, player)
@@ -327,6 +345,11 @@ def _shortlist_ranking_candidates(planets, fleets, player, source, chosen_target
                 and (int(planet.owner) == -1 or quadrant_index(planet) == quadrant_index(source))
             ]
         candidates = filtered or candidates
+
+    if pressure_target is not None and all(
+        int(candidate.id) != int(pressure_target.id) for candidate in candidates
+    ):
+        candidates.append(pressure_target)
 
     ordered = sorted(candidates, key=lambda candidate: _ranking_candidate_sort_key(source, candidate, phase_name))
     same_quadrant = [candidate for candidate in ordered if quadrant_index(candidate) == quadrant_index(source)]
@@ -357,7 +380,16 @@ def _shortlist_ranking_candidates(planets, fleets, player, source, chosen_target
 
     shortlist = []
     seen = set()
-    for candidate in ([chosen_target] if chosen_target is not None else []) + ahead_owner_targets[:top_k] + overtake_targets[:top_k] + same_quadrant[:top_k] + static_targets[:top_k] + chosen_class[:top_k] + ordered[:top_k]:
+    for candidate in (
+        ([chosen_target] if chosen_target is not None else [])
+        + ([pressure_target] if pressure_target is not None else [])
+        + ahead_owner_targets[:top_k]
+        + overtake_targets[:top_k]
+        + same_quadrant[:top_k]
+        + static_targets[:top_k]
+        + chosen_class[:top_k]
+        + ordered[:top_k]
+    ):
         if candidate is None or int(candidate.id) in seen:
             continue
         seen.add(int(candidate.id))
@@ -444,6 +476,15 @@ def game_samples(env, calls_by_step, labels, category, split, sample_stride, tra
                 source_role = roles.get(int(info["source_id"])) if info.get("source_id") is not None else "unknown"
                 ships = int(info.get("ships", 0))
                 owner_scores = owner_control_scores(planets, fleets, player_count=player_count)
+                chosen_trend = trend_identity_details_for_target(
+                    planets,
+                    fleets,
+                    player,
+                    target,
+                    owner_scores=owner_scores,
+                    player_count=player_count,
+                    tendency=tendencies[label],
+                )
                 chosen_overtake = overtake_profile_for_target(
                     planets,
                     fleets,
@@ -517,6 +558,16 @@ def game_samples(env, calls_by_step, labels, category, split, sample_stride, tra
                             "board_ownership_bonus": round(float(chosen_overtake["board_ownership_bonus"]), 6),
                             "projected_overtake_count": round(float(chosen_overtake["projected_overtake_count"]), 6),
                             "overtake_focus_weight": round(float(sample_weight), 6),
+                            "trend_identity": chosen_trend["identity"],
+                            "pressure_reason": chosen_trend["reason"],
+                            "pressure_target_id": chosen_trend["target_id"],
+                            "pressure_quadrant": chosen_trend["quadrant"],
+                            "pressure_source_count": chosen_trend["source_count"],
+                            "pressure_fleet_count": chosen_trend["fleet_count"],
+                            "pressure_hostile_ships": chosen_trend["hostile_ships"],
+                            "pressure_projected_defense": chosen_trend["projected_defense"],
+                            "pressure_defense_ratio": chosen_trend["defense_ratio"],
+                            "pressure_eta_spread": chosen_trend["eta_spread"],
                         }
                     )
                     continue
@@ -552,6 +603,15 @@ def game_samples(env, calls_by_step, labels, category, split, sample_stride, tra
                         candidate,
                         owner_scores=owner_scores,
                         player_count=player_count,
+                    )
+                    alt_trend = trend_identity_details_for_target(
+                        planets,
+                        fleets,
+                        player,
+                        candidate,
+                        owner_scores=owner_scores,
+                        player_count=player_count,
+                        tendency=tendencies[label],
                     )
                     alt_features = action_feature_vector_for_state(
                         planets,
@@ -606,15 +666,16 @@ def game_samples(env, calls_by_step, labels, category, split, sample_stride, tra
                         "board_ownership_bonus": round(float(chosen_overtake["board_ownership_bonus"]), 6),
                         "projected_overtake_count": round(float(chosen_overtake["projected_overtake_count"]), 6),
                         "overtake_focus_weight": round(float(overtake_focus_weight), 6),
-                        "trend_identity": trend_identity_for_target(
-                            planets,
-                            fleets,
-                            player,
-                            candidate,
-                            owner_scores=owner_scores,
-                            player_count=player_count,
-                            tendency=tendencies[label],
-                        ),
+                        "trend_identity": alt_trend["identity"],
+                        "pressure_reason": alt_trend["reason"],
+                        "pressure_target_id": alt_trend["target_id"],
+                        "pressure_quadrant": alt_trend["quadrant"],
+                        "pressure_source_count": alt_trend["source_count"],
+                        "pressure_fleet_count": alt_trend["fleet_count"],
+                        "pressure_hostile_ships": alt_trend["hostile_ships"],
+                        "pressure_projected_defense": alt_trend["projected_defense"],
+                        "pressure_defense_ratio": alt_trend["defense_ratio"],
+                        "pressure_eta_spread": alt_trend["eta_spread"],
                     }
                     rows.append(positive_row)
                     targets.append(1.0)
@@ -760,6 +821,15 @@ def collect_games(args, run_dir):
                 "projected_overtake_count",
                 "overtake_focus_weight",
                 "trend_identity",
+                "pressure_reason",
+                "pressure_target_id",
+                "pressure_quadrant",
+                "pressure_source_count",
+                "pressure_fleet_count",
+                "pressure_hostile_ships",
+                "pressure_projected_defense",
+                "pressure_defense_ratio",
+                "pressure_eta_spread",
             ],
         )
         values_writer = None
@@ -812,6 +882,15 @@ def collect_games(args, run_dir):
                         "projected_overtake_count",
                         "overtake_focus_weight",
                         "trend_identity",
+                        "pressure_reason",
+                        "pressure_target_id",
+                        "pressure_quadrant",
+                        "pressure_source_count",
+                        "pressure_fleet_count",
+                        "pressure_hostile_ships",
+                        "pressure_projected_defense",
+                        "pressure_defense_ratio",
+                        "pressure_eta_spread",
                         "group",
                     ]
                     + [f"f{idx}" for idx in range(len(result["rows"][0]))],
@@ -992,12 +1071,13 @@ def find_promoted_run_dir():
     if not root_model.exists():
         return None
     root_digest = _file_sha256(root_model)
-    for candidate in sorted(ROOT.glob("TRAINING_RUNS/*/model_weights.npz"), reverse=True):
-        try:
-            if _file_sha256(candidate) == root_digest:
-                return candidate.parent
-        except OSError:
-            continue
+    for training_dir in (TRAIN_DIR, LEGACY_TRAIN_DIR):
+        for candidate in sorted(training_dir.glob("*/model_weights.npz"), reverse=True):
+            try:
+                if _file_sha256(candidate) == root_digest:
+                    return candidate.parent
+            except OSError:
+                continue
     return None
 
 
@@ -1026,12 +1106,18 @@ def _adapt_model_to_normalization(model_bundle, mean, std):
     new_std = np.asarray(std, dtype=np.float32).copy()
     if weights.ndim != 1 or old_mean.shape != weights.shape or old_std.shape != weights.shape:
         raise ValueError("Stored model normalization shape mismatch")
-    if new_mean.shape != weights.shape or new_std.shape != weights.shape:
+    if new_mean.ndim != 1 or new_std.shape != new_mean.shape:
         raise ValueError("Current normalization shape mismatch")
+    if new_mean.shape[0] < weights.shape[0]:
+        raise ValueError("Current feature vector is shorter than stored model")
     old_std[old_std < 1e-6] = 1.0
     new_std[new_std < 1e-6] = 1.0
-    scaled_weights = weights * (new_std / old_std)
-    scaled_bias = float(model_bundle["bias"]) + float(np.sum(((new_mean - old_mean) / old_std) * weights))
+    old_dim = weights.shape[0]
+    scaled_weights = np.zeros(new_mean.shape[0], dtype=np.float32)
+    scaled_weights[:old_dim] = weights * (new_std[:old_dim] / old_std)
+    scaled_bias = float(model_bundle["bias"]) + float(
+        np.sum(((new_mean[:old_dim] - old_mean) / old_std) * weights)
+    )
     return scaled_weights.astype(np.float32), np.float32(scaled_bias)
 
 
@@ -1095,7 +1181,7 @@ def train_logistic(arrays, args, run_dir, init_model_path=None):
         model_bundle = _load_model_bundle(init_model_path)
         if model_bundle is None:
             training_info["warm_start_reason"] = "init_model_unavailable"
-        elif int(model_bundle["weights"].shape[0]) != int(xz.shape[1]):
+        elif int(model_bundle["weights"].shape[0]) > int(xz.shape[1]):
             training_info["warm_start_reason"] = (
                 f"feature_dim_mismatch stored={model_bundle['weights'].shape[0]} current={xz.shape[1]}"
             )
@@ -1104,7 +1190,10 @@ def train_logistic(arrays, args, run_dir, init_model_path=None):
                 weights, bias = _adapt_model_to_normalization(model_bundle, mean, std)
                 training_info["warm_start_used"] = True
                 training_info["warm_start_model"] = str(model_bundle["path"])
-                training_info["warm_start_reason"] = "initialized_from_existing_model"
+                if int(model_bundle["weights"].shape[0]) < int(xz.shape[1]):
+                    training_info["warm_start_reason"] = "initialized_from_existing_model_with_zero_weight_appended_features"
+                else:
+                    training_info["warm_start_reason"] = "initialized_from_existing_model"
             except ValueError as exc:
                 training_info["warm_start_reason"] = str(exc)
     progress_path = run_dir / "training_progress.csv"

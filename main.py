@@ -3,7 +3,7 @@ from collections import namedtuple
 from pathlib import Path
 
 try:
-    import agent_smith as _smith_controller
+    from agents import agent_smith as _smith_controller
 except Exception:
     _smith_controller = None
 
@@ -844,6 +844,7 @@ def _load_tactical_model():
         return None
 
     candidates = [ROOT / "model_weights.npz"]
+    candidates.extend(sorted(ROOT.glob("data/training_runs/*/model_weights.npz"), reverse=True))
     candidates.extend(sorted(ROOT.glob("TRAINING_RUNS/*/model_weights.npz"), reverse=True))
     for path in candidates:
         if not path.exists():
@@ -1343,8 +1344,13 @@ def _predict_tactical_value(state, player, planets, fleets, angular_velocity, st
         feeder_planet_id=state.get("static_collector_id"),
         action_angle=measurement.angle,
     )
-    if len(features) != int(model["weights"].shape[0]):
+    model_feature_count = int(model["weights"].shape[0])
+    if len(features) < model_feature_count:
         return None
+    # New action features are append-only so older checkpoints can safely
+    # ignore them until a retrain supplies matching weights.
+    if len(features) > model_feature_count:
+        features = features[:model_feature_count]
 
     vector = np.asarray(features, dtype=np.float32)
     logits = ((vector - model["mean"]) / model["std"]) @ model["weights"] + model["bias"]

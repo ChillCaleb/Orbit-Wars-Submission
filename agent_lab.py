@@ -24,7 +24,7 @@ from watch_match import build_lineup
 
 
 ROOT = Path(__file__).resolve().parent
-LAB_DIR = ROOT / "LAB"
+LAB_DIR = ROOT / "data" / "lab"
 PROGRESSION_PATH = LAB_DIR / "progression.csv"
 
 

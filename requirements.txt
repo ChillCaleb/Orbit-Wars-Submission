@@ -1,3 +1,5 @@
 kaggle-environments>=1.28.0
 imageio
 imageio-ffmpeg
+numpy
+torch
