@@ -1,0 +1,184 @@
+[{"stream_name":"stderr","time":6.389188702,"data":"/usr/local/lib/python3.12/dist-packages/nbformat/__init__.py:96: MissingIDFieldWarning: Cell is missing an id field, this will become a hard error in future nbformat versions. You may want to use `normalize()` on your notebooks before validations (available since nbformat 5.1.4). Previous versions of nbformat are fixing this issue transparently, and will stop doing so in the future.\n"}
+,{"stream_name":"stderr","time":6.389303893,"data":"  validate(nb)\n"}
+,{"stream_name":"stderr","time":7.378590657,"data":"0.00s - Debugger warning: It seems that frozen modules are being used, which may\n"}
+,{"stream_name":"stderr","time":7.3786240880000005,"data":"0.00s - make the debugger miss breakpoints. Please pass -Xfrozen_modules=off\n"}
+,{"stream_name":"stderr","time":7.378628968,"data":"0.00s - to python to disable frozen modules.\n"}
+,{"stream_name":"stderr","time":7.3786325569999995,"data":"0.00s - Note: Debugging will proceed. Set PYDEVD_DISABLE_FILE_VALIDATION=1 to disable this validation.\n"}
+,{"stream_name":"stderr","time":8.002038239,"data":"0.00s - Debugger warning: It seems that frozen modules are being used, which may\n"}
+,{"stream_name":"stderr","time":8.002078799,"data":"0.00s - make the debugger miss breakpoints. Please pass -Xfrozen_modules=off\n"}
+,{"stream_name":"stderr","time":8.002084449,"data":"0.00s - to python to disable frozen modules.\n"}
+,{"stream_name":"stderr","time":8.002088299,"data":"0.00s - Note: Debugging will proceed. Set PYDEVD_DISABLE_FILE_VALIDATION=1 to disable this validation.\n"}
+,{"stream_name":"stdout","time":9.210921415,"data":"Prepared /kaggle/working/orbit_training\n"}
+,{"stream_name":"stdout","time":9.41340453,"data":"Running: /usr/bin/python3 train_tactical_model.py --with-mine-games 500 --without-mine-games 500 --lineup-preset opportunity --training-mode outcome --epochs 12 --batch-size 2048 --lr 0.04 --seed 20260617 --workers 4 --progress-every 50 --out /kaggle/working/training_output --init-from-model /kaggle/working/orbit_training/model_weights.npz\n"}
+,{"stream_name":"stderr","time":43.651362018,"data":"\u001b[92m01:29:58 - LiteLLM:WARNING\u001b[0m: get_model_cost_map.py:271 - LiteLLM: Failed to fetch remote model cost map from https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json: [Errno -3] Temporary failure in name resolution. Falling back to local backup.\n"}
+,{"stream_name":"stderr","time":43.858295775,"data":"\u001b[92m01:29:58 - LiteLLM:WARNING\u001b[0m: get_model_cost_map.py:271 - LiteLLM: Failed to fetch remote model cost map from https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json: [Errno -3] Temporary failure in name resolution. Falling back to local backup.\n"}
+,{"stream_name":"stderr","time":43.858322264,"data":"\n"}
+,{"stream_name":"stderr","time":43.858328564,"data":"\u001b[92m01:29:58 - LiteLLM:WARNING\u001b[0m: get_model_cost_map.py:271 - LiteLLM: Failed to fetch remote model cost map from https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json: [Errno -3] Temporary failure in name resolution. Falling back to local backup.\n"}
+,{"stream_name":"stdout","time":50.090977038,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO: Successfully loaded OpenSpiel environments: 24.\n"}
+,{"stream_name":"stdout","time":50.091020908,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_amazons\n"}
+,{"stream_name":"stdout","time":50.091361768,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_backgammon\n"}
+,{"stream_name":"stdout","time":50.091405588,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_checkers\n"}
+,{"stream_name":"stdout","time":50.091412478,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_chess\n"}
+,{"stream_name":"stdout","time":50.091436008,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_clobber\n"}
+,{"stream_name":"stdout","time":50.091440118,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_coin_game\n"}
+,{"stream_name":"stdout","time":50.091444318,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_coin_game_arena\n"}
+,{"stream_name":"stdout","time":50.091448188,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_connect_four\n"}
+,{"stream_name":"stdout","time":50.091451998,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_dark_hex\n"}
+,{"stream_name":"stdout","time":50.091455598,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_gin_rummy\n"}
+,{"stream_name":"stdout","time":50.091459498,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_go\n"}
+,{"stream_name":"stdout","time":50.091463348,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_goofspiel\n"}
+,{"stream_name":"stdout","time":50.091467289,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_hearts\n"}
+,{"stream_name":"stdout","time":50.091471298,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_hex\n"}
+,{"stream_name":"stdout","time":50.091475129,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_lines_of_action\n"}
+,{"stream_name":"stdout","time":50.091478549,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_matching_pennies_3p\n"}
+,{"stream_name":"stdout","time":50.091482469,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_oshi_zumo\n"}
+,{"stream_name":"stdout","time":50.091486349,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_othello\n"}
+,{"stream_name":"stdout","time":50.091490309,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_repeated_game\n"}
+,{"stream_name":"stdout","time":50.091494158,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_tic_tac_toe\n"}
+,{"stream_name":"stdout","time":50.091498378,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_y\n"}
+,{"stream_name":"stdout","time":50.091502229,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_universal_poker\n"}
+,{"stream_name":"stdout","time":50.091506089,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_repeated_poker\n"}
+,{"stream_name":"stdout","time":50.091510018,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_python_repeated_pokerkit\n"}
+,{"stream_name":"stdout","time":50.091515238,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO: OpenSpiel games skipped: 1.\n"}
+,{"stream_name":"stdout","time":50.091519218,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    snake\n"}
+,{"stream_name":"stdout","time":50.293811964,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO: Successfully loaded OpenSpiel environments: 24.\n"}
+,{"stream_name":"stdout","time":50.293851964,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_amazons\n"}
+,{"stream_name":"stdout","time":50.293856854,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_backgammon\n"}
+,{"stream_name":"stdout","time":50.293860564,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_checkers\n"}
+,{"stream_name":"stdout","time":50.293879264,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_chess\n"}
+,{"stream_name":"stdout","time":50.293883274,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_clobber\n"}
+,{"stream_name":"stdout","time":50.293886784,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_coin_game\n"}
+,{"stream_name":"stdout","time":50.293890144,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_coin_game_arena\n"}
+,{"stream_name":"stdout","time":50.293893424,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_connect_four\n"}
+,{"stream_name":"stdout","time":50.293897184,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_dark_hex\n"}
+,{"stream_name":"stdout","time":50.293900884,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_gin_rummy\n"}
+,{"stream_name":"stdout","time":50.293904344,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_go\n"}
+,{"stream_name":"stdout","time":50.293907774,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_goofspiel\n"}
+,{"stream_name":"stdout","time":50.293911594,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_hearts\n"}
+,{"stream_name":"stdout","time":50.293915184,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_hex\n"}
+,{"stream_name":"stdout","time":50.293918834,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_lines_of_action\n"}
+,{"stream_name":"stdout","time":50.293923124,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_matching_pennies_3p\n"}
+,{"stream_name":"stdout","time":50.293927574,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_oshi_zumo\n"}
+,{"stream_name":"stdout","time":50.293931034,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_othello\n"}
+,{"stream_name":"stdout","time":50.293934684,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_repeated_game\n"}
+,{"stream_name":"stdout","time":50.293938304,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_tic_tac_toe\n"}
+,{"stream_name":"stdout","time":50.293941644,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_y\n"}
+,{"stream_name":"stdout","time":50.293945164,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_universal_poker\n"}
+,{"stream_name":"stdout","time":50.293950104,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_repeated_poker\n"}
+,{"stream_name":"stdout","time":50.293953764,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    open_spiel_python_repeated_pokerkit\n"}
+,{"stream_name":"stdout","time":50.293957444,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO: OpenSpiel games skipped: 1.\n"}
+,{"stream_name":"stdout","time":50.293961144,"data":"[kaggle_environments.envs.open_spiel_env.open_spiel_env] INFO:    snake\n"}
+,{"stream_name":"stdout","time":50.348479127,"data":"Training run: /kaggle/working/training_output/20260617-013005-tactical-outcome\n"}
+,{"stream_name":"stdout","time":50.349553767,"data":"Collecting 1000 games with 4 workers\n"}
+,{"stream_name":"stdout","time":50.550997741,"data":"Training run: /kaggle/working/training_output/20260617-013005-tactical-outcome\n"}
+,{"stream_name":"stdout","time":50.551056731,"data":"Collecting 1000 games with 4 workers\n"}
+,{"stream_name":"stdout","time":66.532312199,"data":"[1/1000] latest=without_mine train seed=20260618 lineup=best smith\n"}
+,{"stream_name":"stdout","time":66.736367255,"data":"[1/1000] latest=without_mine train seed=20260618 lineup=best smith\n"}
+,{"stream_name":"stdout","time":412.991993148,"data":"[50/1000] latest=without_mine train seed=20260665 lineup=best intruder smith 1039\n"}
+,{"stream_name":"stdout","time":413.208556291,"data":"[50/1000] latest=without_mine train seed=20260665 lineup=best intruder smith 1039\n"}
+,{"stream_name":"stdout","time":748.665355072,"data":"[100/1000] latest=without_mine train seed=20260707 lineup=best intruder\n"}
+,{"stream_name":"stdout","time":748.883885949,"data":"[100/1000] latest=without_mine train seed=20260707 lineup=best intruder\n"}
+,{"stream_name":"stdout","time":1058.918124435,"data":"[150/1000] latest=without_mine train seed=20260768 lineup=best smith\n"}
+,{"stream_name":"stdout","time":1059.138576273,"data":"[150/1000] latest=without_mine train seed=20260768 lineup=best smith\n"}
+,{"stream_name":"stdout","time":1421.396598624,"data":"[200/1000] latest=without_mine train seed=20260806 lineup=best intruder 1200 1039\n"}
+,{"stream_name":"stdout","time":1421.611472897,"data":"[200/1000] latest=without_mine train seed=20260806 lineup=best intruder 1200 1039\n"}
+,{"stream_name":"stdout","time":1791.593766202,"data":"[250/1000] latest=without_mine train seed=20260868 lineup=best smith\n"}
+,{"stream_name":"stdout","time":1791.806200159,"data":"[250/1000] latest=without_mine train seed=20260868 lineup=best smith\n"}
+,{"stream_name":"stdout","time":2108.44170606,"data":"[300/1000] latest=without_mine train seed=20260916 lineup=best intruder 1200 1039\n"}
+,{"stream_name":"stdout","time":2108.663522043,"data":"[300/1000] latest=without_mine train seed=20260916 lineup=best intruder 1200 1039\n"}
+,{"stream_name":"stdout","time":2447.041512427,"data":"[350/1000] latest=without_mine train seed=20260968 lineup=best smith\n"}
+,{"stream_name":"stdout","time":2447.257477045,"data":"[350/1000] latest=without_mine train seed=20260968 lineup=best smith\n"}
+,{"stream_name":"stdout","time":2761.55323426,"data":"[400/1000] latest=without_mine train seed=20261015 lineup=best intruder smith 1039\n"}
+,{"stream_name":"stdout","time":2761.766178624,"data":"[400/1000] latest=without_mine train seed=20261015 lineup=best intruder smith 1039\n"}
+,{"stream_name":"stdout","time":3074.076483192,"data":"[450/1000] latest=without_mine test seed=20261067 lineup=best intruder\n"}
+,{"stream_name":"stdout","time":3074.296499943,"data":"[450/1000] latest=without_mine test seed=20261067 lineup=best intruder\n"}
+,{"stream_name":"stdout","time":3340.006980102,"data":"[500/1000] latest=with_mine train seed=20261117 lineup=mine best\n"}
+,{"stream_name":"stdout","time":3340.219487536,"data":"[500/1000] latest=with_mine train seed=20261117 lineup=mine best\n"}
+,{"stream_name":"stdout","time":4035.566085988,"data":"[550/1000] latest=with_mine train seed=20261165 lineup=mine best intruder 1200\n"}
+,{"stream_name":"stdout","time":4035.775898484,"data":"[550/1000] latest=with_mine train seed=20261165 lineup=mine best intruder 1200\n"}
+,{"stream_name":"stdout","time":4831.698515622,"data":"[600/1000] latest=with_mine train seed=20261214 lineup=mine best intruder smith\n"}
+,{"stream_name":"stdout","time":4831.912844565,"data":"[600/1000] latest=with_mine train seed=20261214 lineup=mine best intruder smith\n"}
+,{"stream_name":"stdout","time":5527.535629633,"data":"[650/1000] latest=with_mine train seed=20261267 lineup=mine best\n"}
+,{"stream_name":"stdout","time":5527.751469295,"data":"[650/1000] latest=with_mine train seed=20261267 lineup=mine best\n"}
+,{"stream_name":"stdout","time":6276.580792053,"data":"[700/1000] latest=with_mine train seed=20261318 lineup=mine intruder\n"}
+,{"stream_name":"stdout","time":6276.795197683,"data":"[700/1000] latest=with_mine train seed=20261318 lineup=mine intruder\n"}
+,{"stream_name":"stdout","time":7039.224508884,"data":"[750/1000] latest=with_mine train seed=20261365 lineup=mine best intruder 1200\n"}
+,{"stream_name":"stdout","time":7039.439198487,"data":"[750/1000] latest=with_mine train seed=20261365 lineup=mine best intruder 1200\n"}
+,{"stream_name":"stdout","time":7827.175517691,"data":"[800/1000] latest=with_mine train seed=20261414 lineup=mine best intruder smith\n"}
+,{"stream_name":"stdout","time":7827.401065591,"data":"[800/1000] latest=with_mine train seed=20261414 lineup=mine best intruder smith\n"}
+,{"stream_name":"stdout","time":8545.1148035,"data":"[850/1000] latest=with_mine train seed=20261463 lineup=mine intruder\n"}
+,{"stream_name":"stdout","time":8545.328006965,"data":"[850/1000] latest=with_mine train seed=20261463 lineup=mine intruder\n"}
+,{"stream_name":"stdout","time":9284.53853642,"data":"[900/1000] latest=with_mine test seed=20261517 lineup=mine best\n"}
+,{"stream_name":"stdout","time":9284.75285034,"data":"[900/1000] latest=with_mine test seed=20261517 lineup=mine best\n"}
+,{"stream_name":"stdout","time":10006.909127214,"data":"[950/1000] latest=with_mine test seed=20261567 lineup=mine best\n"}
+,{"stream_name":"stdout","time":10007.12949527,"data":"[950/1000] latest=with_mine test seed=20261567 lineup=mine best\n"}
+,{"stream_name":"stdout","time":10771.17586755,"data":"[1000/1000] latest=with_mine test seed=20261615 lineup=mine best intruder 1200\n"}
+,{"stream_name":"stdout","time":10771.384739681,"data":"[1000/1000] latest=with_mine test seed=20261615 lineup=mine best intruder 1200\n"}
+,{"stream_name":"stdout","time":10772.115500063,"data":"epoch=1 train_loss=0.877263 test_loss=0.879158 train_acc=0.587022 test_acc=0.570837\n"}
+,{"stream_name":"stdout","time":10772.130294628,"data":"epoch=2 train_loss=0.784904 test_loss=0.789129 train_acc=0.639098 test_acc=0.627303\n"}
+,{"stream_name":"stdout","time":10772.153344479,"data":"epoch=4 train_loss=0.700049 test_loss=0.707094 train_acc=0.686441 test_acc=0.674124\n"}
+,{"stream_name":"stdout","time":10772.181533918,"data":"epoch=6 train_loss=0.66369 test_loss=0.672322 train_acc=0.70803 test_acc=0.693574\n"}
+,{"stream_name":"stdout","time":10772.213345096,"data":"epoch=8 train_loss=0.644423 test_loss=0.65354 train_acc=0.720546 test_acc=0.702907\n"}
+,{"stream_name":"stdout","time":10772.25497262,"data":"epoch=10 train_loss=0.632401 test_loss=0.641904 train_acc=0.72798 test_acc=0.712582\n"}
+,{"stream_name":"stdout","time":10772.286427028,"data":"epoch=12 train_loss=0.623909 test_loss=0.633609 train_acc=0.736508 test_acc=0.719392\n"}
+,{"stream_name":"stdout","time":10772.314198368,"data":"Progress: /kaggle/working/training_output/20260617-013005-tactical-outcome/training_progress.csv\n"}
+,{"stream_name":"stdout","time":10772.314302178,"data":"Metrics: /kaggle/working/training_output/20260617-013005-tactical-outcome/metrics.json\n"}
+,{"stream_name":"stdout","time":10772.314396138,"data":"Run log: /kaggle/working/training_output/20260617-013005-tactical-outcome/RUN_LOG.md\n"}
+,{"stream_name":"stdout","time":10772.321755985,"data":"epoch=1 train_loss=0.877263 test_loss=0.879158 train_acc=0.587022 test_acc=0.570837\n"}
+,{"stream_name":"stdout","time":10772.321786485,"data":"epoch=2 train_loss=0.784904 test_loss=0.789129 train_acc=0.639098 test_acc=0.627303\n"}
+,{"stream_name":"stdout","time":10772.321791725,"data":"epoch=4 train_loss=0.700049 test_loss=0.707094 train_acc=0.686441 test_acc=0.674124\n"}
+,{"stream_name":"stdout","time":10772.321812575,"data":"epoch=6 train_loss=0.66369 test_loss=0.672322 train_acc=0.70803 test_acc=0.693574\n"}
+,{"stream_name":"stdout","time":10772.321816805,"data":"epoch=8 train_loss=0.644423 test_loss=0.65354 train_acc=0.720546 test_acc=0.702907\n"}
+,{"stream_name":"stdout","time":10772.321820385,"data":"epoch=10 train_loss=0.632401 test_loss=0.641904 train_acc=0.72798 test_acc=0.712582\n"}
+,{"stream_name":"stdout","time":10772.321823965,"data":"epoch=12 train_loss=0.623909 test_loss=0.633609 train_acc=0.736508 test_acc=0.719392\n"}
+,{"stream_name":"stdout","time":10772.321827255,"data":"Progress: /kaggle/working/training_output/20260617-013005-tactical-outcome/training_progress.csv\n"}
+,{"stream_name":"stdout","time":10772.321830045,"data":"Metrics: /kaggle/working/training_output/20260617-013005-tactical-outcome/metrics.json\n"}
+,{"stream_name":"stdout","time":10772.321832875,"data":"Run log: /kaggle/working/training_output/20260617-013005-tactical-outcome/RUN_LOG.md\n"}
+,{"stream_name":"stdout","time":10773.46673957,"data":"{\n"}
+,{"stream_name":"stdout","time":10773.46677524,"data":"  \"test\": {\n"}
+,{"stream_name":"stdout","time":10773.46678026,"data":"    \"accuracy\": 0.7193922996520996,\n"}
+,{"stream_name":"stdout","time":10773.46678415,"data":"    \"loss\": 0.6336090564727783,\n"}
+,{"stream_name":"stdout","time":10773.4667877,"data":"    \"positive_rate\": 0.5306941270828247,\n"}
+,{"stream_name":"stdout","time":10773.46679118,"data":"    \"samples\": 4997,\n"}
+,{"stream_name":"stdout","time":10773.46679416,"data":"    \"with_mine\": {\n"}
+,{"stream_name":"stdout","time":10773.46679712,"data":"      \"accuracy\": 0.7295612096786499,\n"}
+,{"stream_name":"stdout","time":10773.46680068,"data":"      \"loss\": 0.6309834122657776,\n"}
+,{"stream_name":"stdout","time":10773.46680426,"data":"      \"positive_rate\": 0.5265073180198669,\n"}
+,{"stream_name":"stdout","time":10773.46680741,"data":"      \"samples\": 2797\n"}
+,{"stream_name":"stdout","time":10773.46681075,"data":"    },\n"}
+,{"stream_name":"stdout","time":10773.46681267,"data":"    \"without_mine\": {\n"}
+,{"stream_name":"stdout","time":10773.46681457,"data":"      \"accuracy\": 0.7068866491317749,\n"}
+,{"stream_name":"stdout","time":10773.46681646,"data":"      \"loss\": 0.636837899684906,\n"}
+,{"stream_name":"stdout","time":10773.46681836,"data":"      \"positive_rate\": 0.5358428359031677,\n"}
+,{"stream_name":"stdout","time":10773.46682028,"data":"      \"samples\": 2200\n"}
+,{"stream_name":"stdout","time":10773.46682217,"data":"    }\n"}
+,{"stream_name":"stdout","time":10773.46682402,"data":"  },\n"}
+,{"stream_name":"stdout","time":10773.46682593,"data":"  \"train\": {\n"}
+,{"stream_name":"stdout","time":10773.46682788,"data":"    \"accuracy\": 0.7365076541900635,\n"}
+,{"stream_name":"stdout","time":10773.46682994,"data":"    \"loss\": 0.6239091157913208,\n"}
+,{"stream_name":"stdout","time":10773.46683186,"data":"    \"positive_rate\": 0.5330024361610413,\n"}
+,{"stream_name":"stdout","time":10773.4668339,"data":"    \"samples\": 19218,\n"}
+,{"stream_name":"stdout","time":10773.46683587,"data":"    \"with_mine\": {\n"}
+,{"stream_name":"stdout","time":10773.46683782,"data":"      \"accuracy\": 0.7319067120552063,\n"}
+,{"stream_name":"stdout","time":10773.46683981,"data":"      \"loss\": 0.6268301606178284,\n"}
+,{"stream_name":"stdout","time":10773.46684184,"data":"      \"positive_rate\": 0.5226244330406189,\n"}
+,{"stream_name":"stdout","time":10773.46684379,"data":"      \"samples\": 10235\n"}
+,{"stream_name":"stdout","time":10773.46684573,"data":"    },\n"}
+,{"stream_name":"stdout","time":10773.46684758,"data":"    \"without_mine\": {\n"}
+,{"stream_name":"stdout","time":10773.46686459,"data":"      \"accuracy\": 0.7416006326675415,\n"}
+,{"stream_name":"stdout","time":10773.46686673,"data":"      \"loss\": 0.6206758618354797,\n"}
+,{"stream_name":"stdout","time":10773.46686866,"data":"      \"positive_rate\": 0.5444900989532471,\n"}
+,{"stream_name":"stdout","time":10773.46687061,"data":"      \"samples\": 8983\n"}
+,{"stream_name":"stdout","time":10773.46687257,"data":"    }\n"}
+,{"stream_name":"stdout","time":10773.46687442,"data":"  }\n"}
+,{"stream_name":"stdout","time":10773.46687628,"data":"}\n"}
+,{"stream_name":"stdout","time":10775.092328744,"data":"Output archive: /kaggle/working/orbit_training_output.zip\n"}
+,{"stream_name":"stderr","time":10777.68446366,"data":"/usr/local/lib/python3.12/dist-packages/mistune.py:435: SyntaxWarning: invalid escape sequence '\\|'\n"}
+,{"stream_name":"stderr","time":10777.68450271,"data":"  cells[i][c] = re.sub('\\\\\\\\\\|', '|', cell)\n"}
+,{"stream_name":"stderr","time":10777.834041003,"data":"/usr/local/lib/python3.12/dist-packages/nbconvert/filters/filter_links.py:36: SyntaxWarning: invalid escape sequence '\\_'\n"}
+,{"stream_name":"stderr","time":10777.834077243,"data":"  text = re.sub(r'_', '\\_', text) # Escape underscores in display text\n"}
+,{"stream_name":"stderr","time":10778.485898726,"data":"[NbConvertApp] Converting notebook __notebook__.ipynb to notebook\n"}
+,{"stream_name":"stderr","time":10778.743214528,"data":"[NbConvertApp] Writing 350349 bytes to __notebook__.ipynb\n"}
+,{"stream_name":"stderr","time":10781.196305787,"data":"[NbConvertApp] Converting notebook __notebook__.ipynb to html\n"}
+,{"stream_name":"stderr","time":10781.939825354,"data":"[NbConvertApp] Writing 626129 bytes to __results__.html\n"}
+]

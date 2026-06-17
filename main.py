@@ -1,11 +1,33 @@
 import math
+import os
+import time
 from collections import namedtuple
 from pathlib import Path
 
 try:
-    import agent_smith as _smith_controller
+    from agents import agent_smith as _smith_controller
 except Exception:
     _smith_controller = None
+
+try:
+    from agents import agent_1039_launch_safety as _agent_1039_controller
+except Exception:
+    _agent_1039_controller = None
+
+try:
+    from agents import agent_1200_ppo_strategy as _agent_1200_controller
+except Exception:
+    _agent_1200_controller = None
+
+try:
+    from agents.best_orbit import agent_best_orbit as _agent_best_controller
+except Exception:
+    _agent_best_controller = None
+
+try:
+    from agents.light_intruder import agent_light_intruder as _agent_intruder_controller
+except Exception:
+    _agent_intruder_controller = None
 
 try:
     import numpy as np
@@ -91,10 +113,47 @@ ANCHOR_SMALL_PRESSURED_HOLD_SHIPS = 24
 PRE_ESTABLISHMENT_BURST_MAX_NEED = 12
 PRE_ESTABLISHMENT_TRAP_MAX_ETA = 7.0
 PRE_ESTABLISHMENT_TRAP_SPARE_SHIPS = 4
-ATTACKER_STAGE_TARGET_SHIPS = 32
-ATTACKER_STAGE_IN_QUADRANT_SHIPS = 44
-ATTACKER_STAGE_MIN_FEED = 16
-ATTACKER_STAGE_BIG_FEED = 24
+ATTACKER_STAGE_TARGET_SHIPS = 72
+ATTACKER_STAGE_IN_QUADRANT_SHIPS = 96
+ATTACKER_STAGE_MIN_FEED = 28
+ATTACKER_STAGE_BIG_FEED = 44
+USE_SMITH_DELEGATION = False
+MODEL_PRESSURE_ARRIVAL_WINDOW = 9.0
+MODEL_PRESSURE_MIN_SOURCE_COUNT = 2
+MODEL_PRESSURE_MIN_DEFENSE_RATIO = 0.45
+MODEL_PRESSURE_MIN_HOSTILE_SHIPS = 10
+MODEL_DECISIVE_ATTACK_MIN_MARGIN = 0.0
+MODEL_DECISIVE_OVERPOWER_RATIO = 1.35
+MODEL_DECISIVE_OVERPOWER_MIN_EXTRA = 14
+PROPOSAL_AGENT_TIME_BUDGET = 0.75
+PROPOSAL_MAX_MOVES = 12
+PROPOSAL_SOURCE_PRIOR = {
+    "best": 0.55,
+    "intruder": 0.40,
+    "ppo1200": 0.25,
+    "smith": 0.20,
+}
+CONTROLLER_SOURCE_NAMES = ("best", "intruder", "ppo1200", "smith", "hold")
+CONTROLLER_TREND_NAMES = (
+    "neutral",
+    "pressured",
+    "cash_in",
+    "overtake_window",
+    "chasing_leader",
+    "pressure-cover",
+    "foundation",
+    "maintenance",
+    "thin-enemy",
+    "thin-neutral",
+)
+CONTROLLER_MODEL_WEIGHT = 6.0
+OPPORTUNITY_TREND_BONUS = {
+    "overtake_window": 2.60,
+    "cash_in": 2.25,
+    "chasing_leader": 1.85,
+    "pressured": 1.45,
+    "neutral": 0.0,
+}
 PlanetProfile = namedtuple("PlanetProfile", "planet labels quadrant angle distance_to_center corner_distance")
 AttackMeasurement = namedtuple(
     "AttackMeasurement",
@@ -103,6 +162,8 @@ AttackMeasurement = namedtuple(
 _STATE = {}
 _TACTICAL_MODEL = None
 _TACTICAL_MODEL_ATTEMPTED = False
+_CONTROLLER_MODEL = None
+_CONTROLLER_MODEL_ATTEMPTED = False
 ROOT = Path(__file__).resolve().parent if "__file__" in globals() else Path(".")
 
 
@@ -663,6 +724,28 @@ def _offensive_capture_need(source, target, player, planets, fleets, angular_vel
     return base + support_buffer + static_buffer + big_buffer
 
 
+def _decisive_attack_margin(source, target, player, planets, fleets, angular_velocity, ships=None):
+    if source is None or target is None or int(target.owner) in (int(player), NEUTRAL):
+        return 0.0
+    payload = int(source.ships) if ships is None else int(ships)
+    need = _offensive_capture_need(source, target, player, planets, fleets, angular_velocity)
+    return max(-1.0, min(1.0, (float(payload) - float(need)) / max(12.0, float(need))))
+
+
+def _decisive_attack_payload(available, need, margin):
+    available = int(available)
+    need = int(need)
+    if available <= need:
+        return max(1, min(available, need))
+    ratio = MODEL_DECISIVE_OVERPOWER_RATIO + min(0.45, max(0.0, float(margin)) * 0.30)
+    desired = max(
+        need,
+        int(math.ceil(float(need) * ratio)),
+        need + MODEL_DECISIVE_OVERPOWER_MIN_EXTRA,
+    )
+    return max(1, min(available, desired))
+
+
 def _small_node_hold_level(player, target, planets):
     friendly_support, enemy_support = _local_support_totals(player, target, planets, radius=ATTACK_SUPPORT_RADIUS)
     support_gap = enemy_support - friendly_support
@@ -826,12 +909,22 @@ def _fresh_state():
         "controller_intent": None,
         "controller_intent_until": -1,
         "controller_intent_reason": "smith-native",
+        "model_controller_action": None,
+        "model_controller_reason": "idle",
     }
 
 
 def _sigmoid(value):
     value = max(-60.0, min(60.0, float(value)))
     return 1.0 / (1.0 + math.exp(-value))
+
+
+def _configured_weight_path(env_name):
+    value = os.environ.get(env_name)
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else ROOT / path
 
 
 def _load_tactical_model():
@@ -843,7 +936,12 @@ def _load_tactical_model():
     if np is None:
         return None
 
-    candidates = [ROOT / "model_weights.npz"]
+    candidates = []
+    configured_model = _configured_weight_path("ORBIT_MODEL_WEIGHTS")
+    if configured_model is not None:
+        candidates.append(configured_model)
+    candidates.append(ROOT / "model_weights.npz")
+    candidates.extend(sorted(ROOT.glob("data/training_runs/*/model_weights.npz"), reverse=True))
     candidates.extend(sorted(ROOT.glob("TRAINING_RUNS/*/model_weights.npz"), reverse=True))
     for path in candidates:
         if not path.exists():
@@ -868,6 +966,51 @@ def _load_tactical_model():
             "std": std,
         }
         return _TACTICAL_MODEL
+    return None
+
+
+def _load_controller_model():
+    global _CONTROLLER_MODEL, _CONTROLLER_MODEL_ATTEMPTED
+    if _CONTROLLER_MODEL_ATTEMPTED:
+        return _CONTROLLER_MODEL
+
+    _CONTROLLER_MODEL_ATTEMPTED = True
+    if os.environ.get("ORBIT_DISABLE_CONTROLLER", "").lower() in ("1", "true", "yes"):
+        return None
+    if np is None:
+        return None
+
+    candidates = []
+    configured_model = _configured_weight_path("ORBIT_CONTROLLER_WEIGHTS")
+    if configured_model is not None:
+        candidates.append(configured_model)
+    candidates.append(ROOT / "controller_weights.npz")
+    if os.environ.get("ORBIT_AUTO_CONTROLLER_WEIGHTS", "").lower() in ("1", "true", "yes"):
+        candidates.extend(sorted(ROOT.glob("data/training_runs/*/controller_weights.npz"), reverse=True))
+        candidates.extend(sorted(ROOT.glob("TRAINING_RUNS/*/controller_weights.npz"), reverse=True))
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            with np.load(path) as model:
+                weights = np.asarray(model["weights"], dtype=np.float32)
+                bias = float(np.asarray(model["bias"], dtype=np.float32).reshape(-1)[0])
+                mean = np.asarray(model["mean"], dtype=np.float32)
+                std = np.asarray(model["std"], dtype=np.float32)
+        except Exception:
+            continue
+        if weights.ndim != 1 or weights.shape[0] <= 0 or mean.shape != weights.shape or std.shape != weights.shape:
+            continue
+        std = std.copy()
+        std[std < 1e-6] = 1.0
+        _CONTROLLER_MODEL = {
+            "path": str(path),
+            "weights": weights,
+            "bias": bias,
+            "mean": mean,
+            "std": std,
+        }
+        return _CONTROLLER_MODEL
     return None
 
 
@@ -1343,8 +1486,13 @@ def _predict_tactical_value(state, player, planets, fleets, angular_velocity, st
         feeder_planet_id=state.get("static_collector_id"),
         action_angle=measurement.angle,
     )
-    if len(features) != int(model["weights"].shape[0]):
+    model_feature_count = int(model["weights"].shape[0])
+    if len(features) < model_feature_count:
         return None
+    # New action features are append-only so older checkpoints can safely
+    # ignore them until a retrain supplies matching weights.
+    if len(features) > model_feature_count:
+        features = features[:model_feature_count]
 
     vector = np.asarray(features, dtype=np.float32)
     logits = ((vector - model["mean"]) / model["std"]) @ model["weights"] + model["bias"]
@@ -1473,6 +1621,8 @@ def _drain_bursts(state, player, planets, moves, reserved, angular_velocity):
             continue
         if int(source.owner) != player or int(target.owner) == player:
             continue
+        if int(target.owner) not in (player, NEUTRAL):
+            continue
         if _available(source, reserved) < min(2, burst["remaining"]):
             next_bursts.append(burst)
             continue
@@ -1514,10 +1664,10 @@ def _cleanup_opening_targets(state, player, planets):
 def _send_opening_payload(state, source, target, moves, reserved, angular_velocity, planets=None):
     need_now = int(target.ships) + 1
     available = _available(source, reserved)
-    if available <= 0:
+    if available < need_now:
         return False
 
-    payload = need_now if available >= need_now else available
+    payload = need_now
     measurement = _attack_measurement(source, target, payload, angular_velocity, planets=planets)
     if not measurement.clear:
         return False
@@ -1525,14 +1675,6 @@ def _send_opening_payload(state, source, target, moves, reserved, angular_veloci
     sent = _commit_targeted_move(state, int(source.owner), source, target, moves, reserved, measurement.angle, payload)
     if sent <= 0:
         return False
-
-    if sent < need_now:
-        burst_total = need_now if _is_large_production(source) else int(target.ships) + 2
-        remaining = max(0, burst_total - sent)
-        if remaining:
-            state.setdefault("bursts", []).append(
-                {"source_id": source.id, "target_id": target.id, "remaining": remaining, "require_attack_ready": False}
-            )
     return True
 
 
@@ -1546,12 +1688,21 @@ def _send_expansion_payload(
     need=None,
     require_attack_ready=False,
     planets=None,
+    fleets=None,
+    allow_thin_enemy=False,
 ):
     if not _same_equator_side(source, target):
         return False
 
     if need is None:
         need = _planned_capture_need(source, target, angular_velocity)
+    player = int(source.owner)
+    if int(target.owner) not in (player, NEUTRAL):
+        enemy_need = _offensive_capture_need(source, target, player, planets or [], fleets or [], angular_velocity)
+        need = max(int(need), int(enemy_need))
+        margin = _decisive_attack_margin(source, target, player, planets or [], fleets or [], angular_velocity, ships=need)
+        if not allow_thin_enemy and margin < MODEL_DECISIVE_ATTACK_MIN_MARGIN:
+            return False
     if require_attack_ready and not _expansion_ready_for_need(source, reserved, need):
         return False
 
@@ -1682,6 +1833,7 @@ def _force_nearest_unconquered_move(
                 need=need,
                 require_attack_ready=require_attack_ready,
                 planets=planets,
+                fleets=fleets,
             ):
                 return True
 
@@ -1723,6 +1875,7 @@ def _force_nearest_unconquered_move(
                 need=need,
                 require_attack_ready=require_attack_ready,
                 planets=planets,
+                fleets=fleets,
             ):
                 return True
     return False
@@ -2177,7 +2330,7 @@ def _incoming_threats(player, planets, fleets):
     return threats
 
 
-def _reactive_trap(player, planets, fleets, moves, reserved, blocked_source_ids=None):
+def _reactive_trap(player, planets, fleets, moves, reserved, blocked_source_ids=None, angular_velocity=0.0):
     blocked_source_ids = blocked_source_ids or set()
     responded = set()
     established = _operationally_any_established(planets, player)
@@ -2186,17 +2339,25 @@ def _reactive_trap(player, planets, fleets, moves, reserved, blocked_source_ids=
             continue
         needed = int(fleet.ships) + 1
         available = _available(target, reserved)
+
+        trap_angle = float(fleet.angle) + math.pi
+        first_hit = _first_planet_on_ray(target, trap_angle, planets)
+        if first_hit is None or int(first_hit.owner) == player:
+            continue
+        if int(first_hit.owner) == NEUTRAL:
+            needed = max(needed, _planned_capture_need(target, first_hit, angular_velocity))
+        else:
+            needed = max(
+                needed,
+                _offensive_capture_need(target, first_hit, player, planets, fleets, angular_velocity),
+            )
         if available < needed:
             continue
 
-        trap_angle = float(fleet.angle) + math.pi
         if not established:
             if eta > PRE_ESTABLISHMENT_TRAP_MAX_ETA:
                 continue
             if available - needed < PRE_ESTABLISHMENT_TRAP_SPARE_SHIPS:
-                continue
-            first_hit = _first_planet_on_ray(target, trap_angle, planets)
-            if first_hit is not None and int(first_hit.owner) == player:
                 continue
 
         sent = _add_move(moves, reserved, target, trap_angle, needed)
@@ -2234,8 +2395,11 @@ def _try_capture(
     max_payload=None,
     require_attack_ready=False,
     planets=None,
+    fleets=None,
 ):
     need = _capture_need(source, target, angular_velocity)
+    if int(target.owner) not in (int(player), NEUTRAL):
+        need = max(need, _offensive_capture_need(source, target, player, planets or [], fleets or [], angular_velocity))
     if max_payload is not None:
         need = min(need, int(max_payload))
     if require_attack_ready and not _capture_ready_for_need(source, reserved, need):
@@ -2365,6 +2529,7 @@ def _feeder_logic(state, player, planets, fleets, moves, reserved, angular_veloc
             need=need,
             require_attack_ready=True,
             planets=planets,
+            fleets=fleets,
         ):
             return
 
@@ -2411,6 +2576,7 @@ def _feeder_logic(state, player, planets, fleets, moves, reserved, angular_veloc
             need=need,
             require_attack_ready=True,
             planets=planets,
+            fleets=fleets,
         ):
             return
 
@@ -2437,12 +2603,39 @@ def _role_actions(state, player, planets, fleets, moves, reserved, roles, angula
             ranked_targets = sorted(equator_targets, key=lambda p: _smallest_target_key(source, p))
             ranked_targets = _rerank_targets_with_model(state, player, planets, fleets, angular_velocity, step, source, ranked_targets)
             for target in ranked_targets[:16]:
-                if _try_capture(state, player, source, target, moves, reserved, angular_velocity, require_attack_ready=True, planets=planets):
+                if _try_capture(
+                    state,
+                    player,
+                    source,
+                    target,
+                    moves,
+                    reserved,
+                    angular_velocity,
+                    require_attack_ready=True,
+                    planets=planets,
+                    fleets=fleets,
+                ):
                     break
         elif role == "shield" and _source_can_attempt_capture(source, reserved):
             ranked_targets = sorted(expansion_targets, key=lambda p: _smallest_target_key(source, p))
             ranked_targets = _rerank_targets_with_model(state, player, planets, fleets, angular_velocity, step, source, ranked_targets)
             for target in ranked_targets[:16]:
+                if int(target.owner) not in (player, NEUTRAL):
+                    need = _offensive_capture_need(source, target, player, planets, fleets, angular_velocity)
+                    if _send_expansion_payload(
+                        state,
+                        source,
+                        target,
+                        moves,
+                        reserved,
+                        angular_velocity,
+                        need=need,
+                        require_attack_ready=True,
+                        planets=planets,
+                        fleets=fleets,
+                    ):
+                        break
+                    continue
                 amount = min(30, max(20, _available(source, reserved) - 12))
                 if amount <= 0:
                     continue
@@ -2524,6 +2717,7 @@ def _striker_mode(state, player, planets, fleets, moves, reserved, roles, angula
                 angular_velocity,
                 require_attack_ready=True,
                 planets=planets,
+                fleets=fleets,
             ):
                 break
 
@@ -2699,6 +2893,7 @@ def _pre_establishment_expansion(state, player, planets, fleets, moves, reserved
                 need=need,
                 require_attack_ready=False,
                 planets=planets,
+                fleets=fleets,
             ):
                 claimed_target_ids.add(target.id)
                 break
@@ -2778,6 +2973,7 @@ def _attacker_stage_action(
             need=need,
             require_attack_ready=False,
             planets=planets,
+            fleets=fleets,
         ):
             return
 
@@ -3110,6 +3306,7 @@ def _expansion(state, player, planets, fleets, moves, reserved, roles, angular_v
                     need=need,
                     require_attack_ready=True,
                     planets=planets,
+                    fleets=fleets,
                 ):
                     claimed_target_ids.add(target.id)
                     assaulted = True
@@ -3152,6 +3349,7 @@ def _expansion(state, player, planets, fleets, moves, reserved, roles, angular_v
                     need=need,
                     require_attack_ready=True,
                     planets=planets,
+                    fleets=fleets,
                 ):
                     claimed_target_ids.add(target.id)
                     attacked = True
@@ -3184,9 +3382,986 @@ def _expansion(state, player, planets, fleets, moves, reserved, roles, angular_v
                 need=need,
                 require_attack_ready=True,
                 planets=planets,
+                fleets=fleets,
             ):
                 claimed_target_ids.add(target.id)
                 break
+
+
+def _model_pressure_groups(player, planets, fleets):
+    grouped = {}
+    for eta, fleet, target in _incoming_threats(player, planets, fleets):
+        grouped.setdefault(int(target.id), []).append((float(eta), fleet, target))
+
+    pressure = []
+    for items in grouped.values():
+        target = items[0][2]
+        incoming = sum(int(fleet.ships) for _, fleet, _ in items)
+        source_ids = {int(fleet.from_planet_id) for _, fleet, _ in items if int(fleet.from_planet_id) >= 0}
+        earliest = min(eta for eta, _, _ in items)
+        if (
+            len(source_ids) < MODEL_PRESSURE_MIN_SOURCE_COUNT
+            and incoming < max(MODEL_PRESSURE_MIN_HOSTILE_SHIPS, int(target.ships) * MODEL_PRESSURE_MIN_DEFENSE_RATIO)
+            and earliest > MODEL_PRESSURE_ARRIVAL_WINDOW
+        ):
+            continue
+        pressure.append((earliest, incoming, len(source_ids), target, items))
+
+    pressure.sort(key=lambda item: (item[0], -item[1], int(item[3].ships)))
+    return pressure
+
+
+def _model_source_order(state, player, planets, reserved, roles, primary_anchor_id=None):
+    role_rank = {
+        "attacker": 0,
+        "battery": 1,
+        "feeder": 2,
+        "sweeper": 3,
+        "shield": 4,
+        "anchor": 5,
+        "expander": 6,
+    }
+
+    def key(source):
+        role = roles.get(int(source.id)) or _source_role_for_model(state, player, source, planets, [])
+        return (
+            role_rank.get(role, 7),
+            int(source.id) == int(primary_anchor_id or -1),
+            -_available(source, reserved),
+            _distance_to_center(source),
+        )
+
+    return sorted([p for p in planets if int(p.owner) == int(player)], key=key)
+
+
+def _model_pressure_counter_targets(player, planets, pressure_items, threatened_target, claimed_target_ids):
+    by_id = {int(p.id): p for p in planets}
+    preferred = []
+    for _, fleet, _ in pressure_items:
+        source = by_id.get(int(fleet.from_planet_id))
+        if source is not None and int(source.owner) not in (player, NEUTRAL):
+            preferred.append(source)
+
+    fallback = [
+        p
+        for p in planets
+        if int(p.owner) not in (player, NEUTRAL)
+        and int(p.id) not in claimed_target_ids
+        and _quadrant(p) == _quadrant(threatened_target)
+    ]
+    candidates = _prepend_unique_targets(preferred, fallback)
+
+    return sorted(
+        [p for p in candidates if int(p.id) not in claimed_target_ids],
+        key=lambda p: (
+            p not in preferred,
+            0 if _same_equator_side(p, threatened_target) else 1,
+            int(p.ships),
+            -int(p.production),
+            _distance(p, threatened_target),
+        ),
+    )
+
+
+def _model_pressure_action(
+    state,
+    player,
+    planets,
+    fleets,
+    moves,
+    reserved,
+    roles,
+    angular_velocity,
+    step,
+    primary_anchor_id=None,
+):
+    claimed_target_ids = _claimed_target_ids(state, player, planets, fleets)
+    sources = _model_source_order(state, player, planets, reserved, roles, primary_anchor_id=primary_anchor_id)
+    for earliest, incoming, source_count, threatened, pressure_items in _model_pressure_groups(player, planets, fleets):
+        counter_targets = _model_pressure_counter_targets(player, planets, pressure_items, threatened, claimed_target_ids)
+        for source in sources:
+            if _available(source, reserved) < ATTACK_MIN_FRONTLINE_SHIPS and not _is_large_production(source):
+                continue
+            for target in counter_targets:
+                if not _same_equator_side(source, target):
+                    continue
+                need = _offensive_capture_need(source, target, player, planets, fleets, angular_velocity)
+                if _available(source, reserved) < need:
+                    continue
+                margin = _decisive_attack_margin(source, target, player, planets, fleets, angular_velocity, ships=_available(source, reserved))
+                payload = _decisive_attack_payload(_available(source, reserved), need, margin)
+                if _send_expansion_payload(
+                    state,
+                    source,
+                    target,
+                    moves,
+                    reserved,
+                    angular_velocity,
+                    need=payload,
+                    require_attack_ready=True,
+                    planets=planets,
+                    fleets=fleets,
+                ):
+                    state["model_controller_action"] = "pressure_counter"
+                    state["model_controller_reason"] = "pressure:%s incoming from %s sources" % (
+                        int(incoming),
+                        int(source_count),
+                    )
+                    return "pressure_counter"
+
+        need = max(0, int(incoming) - int(threatened.ships) + 1)
+        hold_need = _small_node_hold_level(player, threatened, planets) - int(threatened.ships)
+        need = max(need, int(hold_need))
+        if need <= 0:
+            continue
+
+        reinforcers = [p for p in sources if int(p.id) != int(threatened.id)]
+        reinforcers.sort(key=lambda p: (_distance(p, threatened), -_available(p, reserved)))
+        for source in reinforcers:
+            keep = 18 if _is_big(source) else 8
+            amount = min(max(0, _available(source, reserved) - keep), need)
+            if amount < min(8, need):
+                continue
+            measurement = _attack_measurement(source, threatened, amount, angular_velocity, planets=planets)
+            if not measurement.clear or measurement.eta > earliest + 2.5:
+                continue
+            if _commit_targeted_move(state, player, source, threatened, moves, reserved, measurement.angle, amount) > 0:
+                state["model_controller_action"] = "pressure_reinforce"
+                state["model_controller_reason"] = "pressure:%s incoming reinforced" % int(incoming)
+                return "pressure_reinforce"
+
+    return None
+
+
+def _model_enemy_candidates(
+    state,
+    source,
+    player,
+    planets,
+    fleets,
+    reserved,
+    claimed_target_ids,
+    angular_velocity,
+    step,
+):
+    candidates = []
+    seen = set()
+
+    def add_targets(items):
+        for target, need in items:
+            if int(target.id) in seen:
+                continue
+            seen.add(int(target.id))
+            candidates.append((target, need))
+
+    add_targets(
+        _established_static_assault_targets(
+            state,
+            source,
+            player,
+            planets,
+            fleets,
+            reserved,
+            claimed_target_ids,
+            angular_velocity,
+            step,
+        )
+    )
+    add_targets(
+        _serious_attack_targets(
+            state,
+            source,
+            player,
+            planets,
+            fleets,
+            reserved,
+            claimed_target_ids,
+            angular_velocity,
+            step,
+        )
+    )
+
+    source_quadrant = _quadrant(source)
+    available = _available(source, reserved)
+    extra_targets = [
+        p
+        for p in planets
+        if int(p.owner) not in (player, NEUTRAL)
+        and int(p.id) not in claimed_target_ids
+        and int(p.id) not in seen
+        and _same_equator_side(source, p)
+        and (_quadrant_distance(source_quadrant, _quadrant(p)) <= 1 or available >= 70)
+    ]
+    extra_targets = _rerank_targets_with_model(state, player, planets, fleets, angular_velocity, step, source, extra_targets)
+    for target in extra_targets[:12]:
+        need = _offensive_capture_need(source, target, player, planets, fleets, angular_velocity)
+        if need <= available:
+            candidates.append((target, need))
+
+    return candidates
+
+
+def _trend_for_model_action(state, player, planets, fleets, target):
+    if _tf_trend_identity_for_target is None:
+        return "neutral"
+    try:
+        return _tf_trend_identity_for_target(
+            planets,
+            fleets,
+            player,
+            target,
+            tendency=_tactical_tendency(state),
+            player_count=_player_count(planets, fleets, player),
+        )
+    except Exception:
+        return "neutral"
+
+
+def _model_decisive_attack_action(
+    state,
+    player,
+    planets,
+    fleets,
+    moves,
+    reserved,
+    roles,
+    angular_velocity,
+    step,
+    primary_anchor_id=None,
+):
+    claimed_target_ids = _claimed_target_ids(state, player, planets, fleets)
+    best = None
+    for source in _model_source_order(state, player, planets, reserved, roles, primary_anchor_id=primary_anchor_id):
+        available = _available(source, reserved)
+        if available < ATTACK_MIN_FRONTLINE_SHIPS and not _is_large_production(source):
+            continue
+        for target, need in _model_enemy_candidates(
+            state,
+            source,
+            player,
+            planets,
+            fleets,
+            reserved,
+            claimed_target_ids,
+            angular_velocity,
+            step,
+        ):
+            if available < need:
+                continue
+            measurement = _attack_measurement(source, target, need, angular_velocity, planets=planets)
+            if not measurement.clear:
+                continue
+            margin = _decisive_attack_margin(source, target, player, planets, fleets, angular_velocity, ships=available)
+            if margin < MODEL_DECISIVE_ATTACK_MIN_MARGIN:
+                continue
+            payload = _decisive_attack_payload(available, need, margin)
+            model_score = _predict_tactical_value(
+                state,
+                player,
+                planets,
+                fleets,
+                angular_velocity,
+                step,
+                source,
+                target,
+                payload,
+            )
+            if model_score is None:
+                model_score = 0.5
+            trend = _trend_for_model_action(state, player, planets, fleets, target)
+            trend_bonus = {
+                "pressured": 20.0,
+                "overtake_window": 24.0,
+                "cash_in": 18.0,
+                "chasing_leader": 14.0,
+                "neutral": 0.0,
+            }.get(trend, 0.0)
+            target_quadrant = _quadrant(target)
+            our_total, enemy_total = _quadrant_totals(player, target_quadrant, planets, fleets=fleets)
+            swing = enemy_total - our_total
+            score = 100.0 * float(model_score)
+            score += 42.0 * float(margin)
+            score += 18.0 * float(target.production)
+            score += 16.0 if _is_big(target) else 4.0
+            score += 10.0 if _is_static(target) else 2.0
+            score += 0.08 * float(swing)
+            score += trend_bonus
+            score -= 0.18 * float(need)
+            score -= 0.65 * _distance(source, target)
+            candidate = (score, source, target, payload, trend, model_score, margin)
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+
+    if best is None:
+        return None
+
+    _, source, target, payload, trend, model_score, margin = best
+    if _send_expansion_payload(
+        state,
+        source,
+        target,
+        moves,
+        reserved,
+        angular_velocity,
+        need=payload,
+        require_attack_ready=True,
+        planets=planets,
+        fleets=fleets,
+    ):
+        claimed_target_ids.add(int(target.id))
+        state["model_controller_action"] = "decisive_attack"
+        state["model_controller_reason"] = "%s target:%s model:%.3f margin:%.3f" % (
+            trend,
+            int(target.id),
+            float(model_score),
+            float(margin),
+        )
+        return "decisive_attack"
+    return None
+
+
+def _model_controller_action(
+    state,
+    player,
+    planets,
+    fleets,
+    moves,
+    reserved,
+    roles,
+    angular_velocity,
+    step,
+    primary_anchor_id=None,
+):
+    state["model_controller_action"] = None
+    state["model_controller_reason"] = "idle"
+    pressure_action = _model_pressure_action(
+        state,
+        player,
+        planets,
+        fleets,
+        moves,
+        reserved,
+        roles,
+        angular_velocity,
+        step,
+        primary_anchor_id=primary_anchor_id,
+    )
+    if pressure_action is not None:
+        return pressure_action
+    return _model_decisive_attack_action(
+        state,
+        player,
+        planets,
+        fleets,
+        moves,
+        reserved,
+        roles,
+        angular_velocity,
+        step,
+        primary_anchor_id=primary_anchor_id,
+    )
+
+
+def _proposal_sources():
+    sources = []
+    if _agent_best_controller is not None:
+        sources.append(("best", _agent_best_controller, "agent"))
+    if _agent_intruder_controller is not None:
+        sources.append(("intruder", _agent_intruder_controller, "agent"))
+    if _agent_1200_controller is not None:
+        sources.append(("ppo1200", _agent_1200_controller, "agent"))
+    if _smith_controller is not None:
+        sources.append(("smith", _smith_controller, "smith"))
+    return sources
+
+
+def _reset_proposal_source_memory(module):
+    runtime = getattr(module, "_RUNTIME", None)
+    if runtime is not None and hasattr(runtime, "reset"):
+        try:
+            runtime.reset()
+        except Exception:
+            pass
+
+
+def _reset_proposal_sources_for_new_game(state, step):
+    if int(step) != 0 or state.get("proposal_sources_reset_turn") == 0:
+        return
+    for _, module, _ in _proposal_sources():
+        _reset_proposal_source_memory(module)
+    state["proposal_sources_reset_turn"] = 0
+
+
+def _call_proposal_source(name, module, kind, obs, config, state, player, planets, fleets, step):
+    try:
+        if kind == "smith":
+            intent = _smith_controller_intent(state, player, planets, fleets, step)
+            return module.controller_agent(obs, config=config, intent=intent)
+        agent_fn = getattr(module, "agent", None)
+        if agent_fn is None:
+            return []
+        try:
+            return agent_fn(obs, config)
+        except TypeError:
+            return agent_fn(obs)
+    except Exception:
+        return []
+
+
+def _proposal_target_for_move(move, planets):
+    if _tf_infer_action_target is not None:
+        try:
+            target = _tf_infer_action_target(move, planets)
+            if target is not None:
+                return target
+        except Exception:
+            pass
+    by_id = {int(p.id): p for p in planets}
+    source = by_id.get(int(move[0])) if move and len(move) >= 1 else None
+    if source is None:
+        return None
+    return _first_planet_on_ray(source, float(move[1]), planets)
+
+
+def _sanitize_proposal_moves(moves, player, planets):
+    by_id = {int(p.id): p for p in planets}
+    reserved = {}
+    cleaned = []
+    invalid = 0.0
+    for move in list(moves or [])[:PROPOSAL_MAX_MOVES]:
+        if not move or len(move) < 3:
+            invalid += 1.0
+            continue
+        try:
+            source_id = int(move[0])
+            angle = _norm_angle(float(move[1]))
+            ships = int(move[2])
+        except Exception:
+            invalid += 1.0
+            continue
+        source = by_id.get(source_id)
+        if source is None or int(source.owner) != int(player) or ships <= 0:
+            invalid += 1.0
+            continue
+        amount = min(ships, _available(source, reserved))
+        if amount <= 0:
+            invalid += 1.0
+            continue
+        if amount < ships:
+            invalid += 0.25 + (float(ships - amount) / max(1.0, float(ships)))
+        if not _angle_clear_of_sun(source, angle):
+            invalid += 1.5
+            continue
+        cleaned.append([source_id, angle, amount])
+        reserved[source_id] = reserved.get(source_id, 0) + amount
+    return cleaned, invalid
+
+
+def _proposal_pressure_lookup(player, planets, fleets):
+    pressure = {}
+    for eta, fleet, target in _incoming_threats(player, planets, fleets):
+        row = pressure.setdefault(int(target.id), {"ships": 0, "earliest": float(eta), "sources": set()})
+        row["ships"] += int(fleet.ships)
+        row["earliest"] = min(float(row["earliest"]), float(eta))
+        if int(fleet.from_planet_id) >= 0:
+            row["sources"].add(int(fleet.from_planet_id))
+    return pressure
+
+
+def _fallback_action_value(state, player, planets, fleets, angular_velocity, step, source, target, ships):
+    if target is None or source is None or int(ships) <= 0:
+        return 0.0
+    if int(target.owner) == int(player):
+        pressure = _proposal_pressure_lookup(player, planets, fleets).get(int(target.id))
+        if pressure:
+            need = max(1, int(pressure["ships"]) - int(target.ships) + 1)
+            return 0.55 + min(1.0, float(ships) / float(max(1, need)))
+        return 0.18
+    if int(target.owner) == NEUTRAL:
+        need = _planned_capture_need(source, target, angular_velocity)
+        capture_bonus = 0.55 if int(ships) >= int(need) else -0.35
+        return capture_bonus + 0.10 * float(target.production) + (0.08 if _is_static(target) else 0.0)
+    need = _offensive_capture_need(source, target, player, planets, fleets, angular_velocity)
+    margin = (float(ships) - float(need)) / max(12.0, float(need))
+    return 0.55 + 0.65 * margin + 0.10 * float(target.production) + (0.12 if _is_big(target) else 0.0)
+
+
+def _proposal_opportunity_value(state, player, planets, fleets, angular_velocity, step, source, target, ships):
+    if source is None or target is None or int(ships) <= 0:
+        return 0.0, "none"
+    if int(target.owner) == int(player):
+        pressure = _proposal_pressure_lookup(player, planets, fleets).get(int(target.id))
+        return (0.45, "pressure-cover") if pressure else (-0.70, "maintenance")
+    if int(target.owner) == NEUTRAL:
+        owned_count = sum(1 for p in planets if int(p.owner) == int(player))
+        need = _planned_capture_need(source, target, angular_velocity)
+        if int(ships) < int(need):
+            return -0.45, "thin-neutral"
+        foundation_bonus = 0.75 if owned_count < 3 else 0.05
+        prod_bonus = 0.08 * float(target.production)
+        static_bonus = 0.10 if _is_static(target) and owned_count < 4 else 0.0
+        return foundation_bonus + prod_bonus + static_bonus, "foundation" if owned_count < 3 else "neutral"
+
+    need = _offensive_capture_need(source, target, player, planets, fleets, angular_velocity)
+    margin = (float(ships) - float(need)) / max(12.0, float(need))
+    if margin < -0.20:
+        return -1.60, "thin-enemy"
+
+    trend = _trend_for_model_action(state, player, planets, fleets, target)
+    target_quadrant = _quadrant(target)
+    our_total, enemy_total = _quadrant_totals(player, target_quadrant, planets, fleets=fleets)
+    quadrant_swing = max(0.0, float(enemy_total - our_total)) / 110.0
+    production_swing = float(target.production) / 5.0
+    pressure_source_ships = sum(
+        int(fleet.ships)
+        for fleet in fleets or []
+        if int(fleet.owner) not in (player, NEUTRAL) and int(fleet.from_planet_id) == int(target.id)
+    )
+    pressure_source_bonus = min(1.4, float(pressure_source_ships) / 65.0)
+    decisive_bonus = max(0.0, min(2.0, margin * 2.4))
+    structural_bonus = 0.35 if _is_big(target) else 0.0
+    structural_bonus += 0.25 if _is_static(target) else 0.0
+    trend_bonus = float(OPPORTUNITY_TREND_BONUS.get(trend, 0.0))
+    opportunity = (
+        1.05
+        + trend_bonus
+        + decisive_bonus
+        + 0.85 * production_swing
+        + 0.55 * quadrant_swing
+        + pressure_source_bonus
+        + structural_bonus
+    )
+    return opportunity, trend
+
+
+def _controller_clip(value, scale=1.0, limit=4.0):
+    if scale == 0:
+        scale = 1.0
+    scaled = float(value) / float(scale)
+    return max(-float(limit), min(float(limit), scaled))
+
+
+def _controller_ratio(part, whole):
+    return 0.0 if float(whole) <= 0.0 else float(part) / float(whole)
+
+
+def _controller_one_hot(value, names):
+    return [1.0 if value == name else 0.0 for name in names]
+
+
+def _controller_proposal_features(state, proposal, player, planets, fleets, angular_velocity, step):
+    moves = proposal.get("moves", []) or []
+    name = proposal.get("name", "unknown")
+    by_id = {int(p.id): p for p in planets}
+    pressure = _proposal_pressure_lookup(player, planets, fleets)
+    player_count = _player_count(planets, fleets, player)
+    owned = [p for p in planets if int(p.owner) == int(player)]
+    enemy_owned = [p for p in planets if int(p.owner) not in (int(player), NEUTRAL)]
+    neutral_owned = [p for p in planets if int(p.owner) == NEUTRAL]
+    incoming_ships = sum(int(row["ships"]) for row in pressure.values())
+    max_pressure = max((int(row["ships"]) for row in pressure.values()), default=0)
+    stockpile = max((int(p.ships) for p in owned), default=0)
+
+    move_count = len(moves)
+    ships_total = 0
+    max_ships = 0
+    target_ids = set()
+    source_quadrants = set()
+    target_quadrants = set()
+    owner_counts = {"enemy": 0, "neutral": 0, "friendly": 0, "unknown": 0}
+    owner_ships = {"enemy": 0, "neutral": 0, "friendly": 0, "unknown": 0}
+    enemy_max = 0
+    friendly_pressure_count = 0
+    friendly_pressure_coverage = 0.0
+    maintenance_count = 0
+    source_drain_pressure_count = 0
+    static_count = 0
+    rotating_count = 0
+    big_count = 0
+    same_quadrant_count = 0
+    enemy_margin_sum = 0.0
+    enemy_margin_min = 4.0
+    enemy_margin_max = -4.0
+    decisive_enemy_count = 0
+    thin_enemy_count = 0
+    neutral_capture_count = 0
+    thin_neutral_count = 0
+    opportunity_total = 0.0
+    best_opportunity = -4.0
+    positive_opportunity_count = 0
+    trend_counts = {trend: 0 for trend in CONTROLLER_TREND_NAMES}
+
+    for move in moves:
+        if not move or len(move) < 3:
+            continue
+        source = by_id.get(int(move[0]))
+        target = _proposal_target_for_move(move, planets)
+        ships = int(move[2])
+        ships_total += ships
+        max_ships = max(max_ships, ships)
+        if source is not None:
+            source_quadrants.add(_quadrant(source))
+        if target is None:
+            owner_group = "unknown"
+        else:
+            target_ids.add(int(target.id))
+            target_quadrants.add(_quadrant(target))
+            if _is_static(target):
+                static_count += 1
+            else:
+                rotating_count += 1
+            if _is_big(target):
+                big_count += 1
+            if source is not None and _quadrant(source) == _quadrant(target):
+                same_quadrant_count += 1
+            if int(target.owner) == int(player):
+                owner_group = "friendly"
+                target_pressure = pressure.get(int(target.id))
+                if target_pressure:
+                    needed = max(1, int(target_pressure["ships"]) - int(target.ships) + 1)
+                    friendly_pressure_count += 1
+                    friendly_pressure_coverage += min(2.5, float(ships) / float(max(1, needed)))
+                else:
+                    maintenance_count += 1
+            elif int(target.owner) == NEUTRAL:
+                owner_group = "neutral"
+                need = _planned_capture_need(source, target, angular_velocity) if source is not None else int(target.ships) + 1
+                if ships >= need:
+                    neutral_capture_count += 1
+                else:
+                    thin_neutral_count += 1
+            else:
+                owner_group = "enemy"
+                enemy_max = max(enemy_max, ships)
+                need = _offensive_capture_need(source, target, player, planets, fleets, angular_velocity) if source is not None else int(target.ships) + 1
+                margin = (float(ships) - float(need)) / max(12.0, float(need))
+                enemy_margin_sum += margin
+                enemy_margin_min = min(enemy_margin_min, margin)
+                enemy_margin_max = max(enemy_margin_max, margin)
+                if margin >= 0.0:
+                    decisive_enemy_count += 1
+                else:
+                    thin_enemy_count += 1
+
+            if source is not None and int(source.id) in pressure:
+                source_drain_pressure_count += 1
+
+        owner_counts[owner_group] += 1
+        owner_ships[owner_group] += ships
+        opportunity_value, opportunity_reason = _proposal_opportunity_value(
+            state,
+            player,
+            planets,
+            fleets,
+            angular_velocity,
+            step,
+            source,
+            target,
+            ships,
+        )
+        opportunity_total += float(opportunity_value)
+        best_opportunity = max(best_opportunity, float(opportunity_value))
+        if opportunity_value > 0.0:
+            positive_opportunity_count += 1
+        if opportunity_reason in trend_counts:
+            trend_counts[opportunity_reason] += 1
+
+    enemy_count = owner_counts["enemy"]
+    if enemy_count == 0:
+        enemy_margin_min = 0.0
+        enemy_margin_max = 0.0
+    enemy_margin_avg = _controller_ratio(enemy_margin_sum, enemy_count)
+    avg_ships = _controller_ratio(ships_total, move_count)
+
+    features = [
+        _controller_clip(step, TOTAL_STEPS),
+        _controller_clip(player_count, 4.0),
+        _controller_clip(len(planets), 40.0),
+        _controller_clip(len(fleets or []), 180.0),
+        _controller_clip(len(owned), 32.0),
+        _controller_clip(len(enemy_owned), 32.0),
+        _controller_clip(len(neutral_owned), 32.0),
+        _controller_clip(incoming_ships, 400.0),
+        _controller_clip(len(pressure), 8.0),
+        _controller_clip(max_pressure, 220.0),
+        _controller_clip(stockpile, 300.0),
+    ]
+    features.extend(_controller_one_hot(name, CONTROLLER_SOURCE_NAMES))
+    features.extend(
+        [
+            _controller_clip(float(proposal.get("score", 0.0)), 18.0),
+            _controller_clip(move_count, float(PROPOSAL_MAX_MOVES)),
+            _controller_clip(ships_total, 520.0),
+            _controller_clip(avg_ships, 120.0),
+            _controller_clip(max_ships, 260.0),
+            _controller_clip(len(target_ids), float(PROPOSAL_MAX_MOVES)),
+            _controller_clip(len(source_quadrants), 4.0),
+            _controller_clip(len(target_quadrants), 4.0),
+            _controller_clip(owner_counts["enemy"], float(PROPOSAL_MAX_MOVES)),
+            _controller_clip(owner_ships["enemy"], 520.0),
+            _controller_clip(enemy_max, 260.0),
+            _controller_clip(owner_counts["neutral"], float(PROPOSAL_MAX_MOVES)),
+            _controller_clip(owner_ships["neutral"], 520.0),
+            _controller_clip(owner_counts["friendly"], float(PROPOSAL_MAX_MOVES)),
+            _controller_clip(owner_ships["friendly"], 520.0),
+            _controller_clip(friendly_pressure_count, float(PROPOSAL_MAX_MOVES)),
+            _controller_clip(friendly_pressure_coverage, 5.0),
+            _controller_clip(maintenance_count, float(PROPOSAL_MAX_MOVES)),
+            _controller_clip(source_drain_pressure_count, float(PROPOSAL_MAX_MOVES)),
+            _controller_clip(static_count, float(PROPOSAL_MAX_MOVES)),
+            _controller_clip(rotating_count, float(PROPOSAL_MAX_MOVES)),
+            _controller_clip(big_count, float(PROPOSAL_MAX_MOVES)),
+            _controller_clip(same_quadrant_count, float(PROPOSAL_MAX_MOVES)),
+            _controller_clip(enemy_margin_avg, 1.5),
+            _controller_clip(enemy_margin_min, 1.5),
+            _controller_clip(enemy_margin_max, 1.5),
+            _controller_clip(decisive_enemy_count, float(PROPOSAL_MAX_MOVES)),
+            _controller_clip(thin_enemy_count, float(PROPOSAL_MAX_MOVES)),
+            _controller_clip(neutral_capture_count, float(PROPOSAL_MAX_MOVES)),
+            _controller_clip(thin_neutral_count, float(PROPOSAL_MAX_MOVES)),
+            _controller_clip(opportunity_total, 18.0),
+            _controller_clip(best_opportunity, 8.0),
+            _controller_clip(positive_opportunity_count, float(PROPOSAL_MAX_MOVES)),
+            _controller_ratio(owner_ships["enemy"], max(1, ships_total)),
+            _controller_ratio(owner_ships["friendly"], max(1, ships_total)),
+            _controller_ratio(owner_ships["neutral"], max(1, ships_total)),
+        ]
+    )
+    features.extend(
+        [
+            _controller_clip(trend_counts[trend], float(PROPOSAL_MAX_MOVES))
+            for trend in CONTROLLER_TREND_NAMES
+        ]
+    )
+    return features
+
+
+def _predict_controller_value(features):
+    model = _load_controller_model()
+    if model is None or np is None:
+        return None
+    vector = np.asarray(features, dtype=np.float32)
+    if vector.ndim != 1 or vector.shape[0] != int(model["weights"].shape[0]):
+        return None
+    z = ((vector - model["mean"]) / model["std"]) @ model["weights"] + float(model["bias"])
+    return _sigmoid(float(z))
+
+
+def _apply_controller_model_to_proposal(state, proposal, player, planets, fleets, angular_velocity, step):
+    features = _controller_proposal_features(state, proposal, player, planets, fleets, angular_velocity, step)
+    prediction = _predict_controller_value(features)
+    proposal["controller_feature_dim"] = len(features)
+    if prediction is None:
+        return proposal
+    proposal["controller_value"] = float(prediction)
+    proposal["score"] = float(proposal["score"]) + CONTROLLER_MODEL_WEIGHT * (float(prediction) - 0.5)
+    reason = proposal.get("reason", "")
+    suffix = "ctrl:%.2f" % float(prediction)
+    proposal["reason"] = f"{reason},{suffix}" if reason else suffix
+    return proposal
+
+
+def _score_proposal(state, name, moves, player, planets, fleets, angular_velocity, step, apply_controller=True):
+    cleaned, invalid = _sanitize_proposal_moves(moves, player, planets)
+    if not cleaned:
+        return None
+
+    by_id = {int(p.id): p for p in planets}
+    pressure = _proposal_pressure_lookup(player, planets, fleets)
+    claimed_target_ids = _claimed_target_ids(state, player, planets, fleets)
+    total = 0.0
+    best_single = -999.0
+    enemy_attacks = 0
+    neutral_captures = 0
+    useful_reinforce = 0
+    maintenance_moves = 0
+    opportunity_total = 0.0
+    best_opportunity = -999.0
+    ships_total = 0
+    target_ids = set()
+    reasons = []
+
+    for move in cleaned:
+        source = by_id.get(int(move[0]))
+        target = _proposal_target_for_move(move, planets)
+        ships = int(move[2])
+        ships_total += ships
+        if source is None or target is None:
+            total -= 0.35
+            continue
+        target_ids.add(int(target.id))
+        already_claimed = int(target.id) in claimed_target_ids and int(target.owner) != int(player)
+        model_score = _predict_tactical_value(
+            state,
+            player,
+            planets,
+            fleets,
+            angular_velocity,
+            step,
+            source,
+            target,
+            ships,
+        )
+        if model_score is None:
+            model_score = _fallback_action_value(state, player, planets, fleets, angular_velocity, step, source, target, ships)
+        action_score = float(model_score)
+        opportunity_value, opportunity_reason = _proposal_opportunity_value(
+            state,
+            player,
+            planets,
+            fleets,
+            angular_velocity,
+            step,
+            source,
+            target,
+            ships,
+        )
+        opportunity_total += float(opportunity_value)
+        best_opportunity = max(best_opportunity, float(opportunity_value))
+
+        if int(target.owner) == int(player):
+            target_pressure = pressure.get(int(target.id))
+            if target_pressure:
+                needed = max(1, int(target_pressure["ships"]) - int(target.ships) + 1)
+                coverage = min(1.6, float(ships) / float(max(1, needed)))
+                action_score += 0.70 + coverage
+                useful_reinforce += 1
+            else:
+                action_score -= 0.85
+                maintenance_moves += 1
+        elif int(target.owner) == NEUTRAL:
+            need = _planned_capture_need(source, target, angular_velocity)
+            if ships >= need:
+                owned_count = sum(1 for p in planets if int(p.owner) == int(player))
+                foundation_scale = 1.0 if owned_count < 3 else 0.30
+                action_score += foundation_scale * (0.35 + 0.05 * float(target.production))
+                neutral_captures += 1
+            else:
+                action_score -= 0.75
+        else:
+            need = _offensive_capture_need(source, target, player, planets, fleets, angular_velocity)
+            margin = (float(ships) - float(need)) / max(12.0, float(need))
+            action_score += 1.45 + 2.15 * margin + 0.16 * float(target.production)
+            action_score += 0.35 if _is_big(target) else 0.0
+            action_score += 0.22 if _is_static(target) else 0.0
+            action_score += 0.55 * float(opportunity_value)
+            if margin < 0.0:
+                action_score -= 1.65
+            else:
+                enemy_attacks += 1
+
+        if already_claimed:
+            action_score -= 1.35
+
+        total += action_score
+        best_single = max(best_single, action_score)
+
+    diversity = min(3, len(target_ids)) * 0.08
+    total += best_single * 0.55
+    total += float(PROPOSAL_SOURCE_PRIOR.get(name, 0.0))
+    total += enemy_attacks * 0.90
+    total += neutral_captures * 0.05
+    total += useful_reinforce * 0.12
+    total += 0.95 * opportunity_total
+    total += 0.65 * best_opportunity
+    total += diversity
+    total -= invalid * 1.3
+    total -= max(0, len(cleaned) - 7) * 0.20
+    total -= maintenance_moves * 0.55
+    total -= max(0, ships_total - 220) * 0.004
+
+    if enemy_attacks:
+        reasons.append("enemy:%d" % enemy_attacks)
+    if best_opportunity > 0:
+        reasons.append("opp:%.2f" % float(best_opportunity))
+    if useful_reinforce:
+        reasons.append("reinforce:%d" % useful_reinforce)
+    if neutral_captures:
+        reasons.append("neutral:%d" % neutral_captures)
+    reasons.append("ships:%d" % ships_total)
+    proposal = {
+        "name": name,
+        "moves": cleaned,
+        "score": total,
+        "reason": ",".join(reasons),
+    }
+    if apply_controller:
+        proposal = _apply_controller_model_to_proposal(
+            state,
+            proposal,
+            player,
+            planets,
+            fleets,
+            angular_velocity,
+            step,
+        )
+    return proposal
+
+
+def _hold_proposal_score(player, planets, fleets):
+    pressure = _proposal_pressure_lookup(player, planets, fleets)
+    incoming = sum(int(row["ships"]) for row in pressure.values())
+    owned = [p for p in planets if int(p.owner) == int(player)]
+    stockpile = max((int(p.ships) for p in owned), default=0)
+    owned_count = len(owned)
+    neutral_targets = sum(1 for p in planets if int(p.owner) == NEUTRAL)
+    if incoming > 0:
+        return -0.65 - min(1.5, float(incoming) / 80.0)
+    if owned_count < 3 and neutral_targets:
+        return -0.25
+    if stockpile >= 70:
+        return 0.15
+    return 0.20
+
+
+def proposal_selector_agent(obs, config=None):
+    player, planets, fleets, angular_velocity, _ = _parse(obs)
+    state = _state_for(player, obs)
+    state["turn_claimed_target_ids"] = set()
+    step = int(_obs_get(obs, "step", _obs_get(obs, "turn", 0)) or 0)
+    if not planets:
+        return []
+
+    _update_tactical_events(state, player, planets)
+    _update_recent_static_capture_focus(state, player, planets)
+    _reset_proposal_sources_for_new_game(state, step)
+
+    deadline = time.perf_counter() + PROPOSAL_AGENT_TIME_BUDGET
+    proposals = []
+    for name, module, kind in _proposal_sources():
+        if time.perf_counter() > deadline and proposals:
+            break
+        raw_moves = _call_proposal_source(name, module, kind, obs, config, state, player, planets, fleets, step)
+        scored = _score_proposal(state, name, raw_moves, player, planets, fleets, angular_velocity, step)
+        if scored is not None:
+            proposals.append(scored)
+
+    hold_proposal = {
+        "name": "hold",
+        "moves": [],
+        "score": _hold_proposal_score(player, planets, fleets),
+        "reason": "stockpile",
+    }
+    proposals.append(
+        _apply_controller_model_to_proposal(
+            state,
+            hold_proposal,
+            player,
+            planets,
+            fleets,
+            angular_velocity,
+            step,
+        )
+    )
+
+    selected = max(proposals, key=lambda proposal: proposal["score"])
+    state["proposal_source"] = selected["name"]
+    state["proposal_reason"] = "score:%.3f %s" % (float(selected["score"]), selected["reason"])
+    for move in selected["moves"]:
+        target = _proposal_target_for_move(move, planets)
+        if target is not None:
+            _record_tactical_move(state, player, target, int(move[2]))
+    return selected["moves"]
 
 
 def anchor_feeder_agent(obs, config=None):
@@ -3206,7 +4381,15 @@ def anchor_feeder_agent(obs, config=None):
     blocked_trap_ids = {battery_anchor.id} if battery_anchor is not None else set()
     roles = _our_roles(planets, player, fleets=fleets, state=state)
 
-    _reactive_trap(player, planets, fleets, moves, reserved, blocked_source_ids=blocked_trap_ids)
+    _reactive_trap(
+        player,
+        planets,
+        fleets,
+        moves,
+        reserved,
+        blocked_source_ids=blocked_trap_ids,
+        angular_velocity=angular_velocity,
+    )
     _drain_bursts(state, player, planets, moves, reserved, angular_velocity)
     _initiation_phase(state, player, planets, moves, reserved, angular_velocity)
     owned_count = sum(1 for p in planets if int(p.owner) == player)
@@ -3224,13 +4407,27 @@ def anchor_feeder_agent(obs, config=None):
     roles = _our_roles(planets, player, fleets=fleets, state=state)
     _primary_anchor_action(state, player, planets, moves, reserved, angular_velocity)
     primary_anchor_id = state.get("primary_anchor_id")
-    _attacker_stage_action(state, player, planets, fleets, moves, reserved, angular_velocity, step, primary_anchor_id=primary_anchor_id)
-    _striker_mode(state, player, planets, fleets, moves, reserved, roles, angular_velocity, step, primary_anchor_id=primary_anchor_id)
+    model_action = _model_controller_action(
+        state,
+        player,
+        planets,
+        fleets,
+        moves,
+        reserved,
+        roles,
+        angular_velocity,
+        step,
+        primary_anchor_id=primary_anchor_id,
+    )
+    if model_action not in ("decisive_attack", "pressure_counter"):
+        _attacker_stage_action(state, player, planets, fleets, moves, reserved, angular_velocity, step, primary_anchor_id=primary_anchor_id)
+        _striker_mode(state, player, planets, fleets, moves, reserved, roles, angular_velocity, step, primary_anchor_id=primary_anchor_id)
     _feeder_logic(state, player, planets, fleets, moves, reserved, angular_velocity, step, primary_anchor_id=primary_anchor_id)
     collector_id = state.get("static_collector_id")
     collector_blocked_ids = {collector_id} if collector_id is not None else set()
-    _role_actions(state, player, planets, fleets, moves, reserved, roles, angular_velocity, step, blocked_source_ids=collector_blocked_ids)
-    _expansion(state, player, planets, fleets, moves, reserved, roles, angular_velocity, step)
+    if model_action not in ("decisive_attack", "pressure_counter"):
+        _role_actions(state, player, planets, fleets, moves, reserved, roles, angular_velocity, step, blocked_source_ids=collector_blocked_ids)
+        _expansion(state, player, planets, fleets, moves, reserved, roles, angular_velocity, step)
     if not moves:
         _force_nearest_unconquered_move(
             state,
@@ -3249,7 +4446,7 @@ def anchor_feeder_agent(obs, config=None):
 
 
 def smith_moveset_agent(obs, config=None):
-    if _smith_controller is None:
+    if _smith_controller is None or not USE_SMITH_DELEGATION:
         return anchor_feeder_agent(obs, config)
 
     player, planets, fleets, _, _ = _parse(obs)
@@ -3268,7 +4465,7 @@ def smith_moveset_agent(obs, config=None):
 
 
 def agent(obs, config=None):
-    return smith_moveset_agent(obs, config)
+    return proposal_selector_agent(obs, config)
 
 
-nearest_planet_sniper = smith_moveset_agent
+nearest_planet_sniper = proposal_selector_agent

@@ -1,0 +1,38 @@
+{
+  "test": {
+    "accuracy": 0.6472189426422119,
+    "loss": 0.7681549191474915,
+    "positive_rate": 0.537663459777832,
+    "samples": 1013,
+    "with_mine": {
+      "accuracy": 0.6468209028244019,
+      "loss": 0.7574818730354309,
+      "positive_rate": 0.5396170616149902,
+      "samples": 621
+    },
+    "without_mine": {
+      "accuracy": 0.6478289365768433,
+      "loss": 0.7845080494880676,
+      "positive_rate": 0.5346702337265015,
+      "samples": 392
+    }
+  },
+  "train": {
+    "accuracy": 0.6485621929168701,
+    "loss": 0.7545371055603027,
+    "positive_rate": 0.5263053774833679,
+    "samples": 3798,
+    "with_mine": {
+      "accuracy": 0.627415657043457,
+      "loss": 0.7620492577552795,
+      "positive_rate": 0.5207478404045105,
+      "samples": 2024
+    },
+    "without_mine": {
+      "accuracy": 0.6719688773155212,
+      "loss": 0.7462222576141357,
+      "positive_rate": 0.5324570536613464,
+      "samples": 1774
+    }
+  }
+}

@@ -1,0 +1,3 @@
+timestamp,run_id,lineup,player,wins,ties,games,launches_per_game,ships_launched_per_game,static_target_pct,rotating_big_targets_per_game,neutral_target_pct,enemy_target_pct,captures_per_game,losses_per_game,avg_final_production,avg_final_ships,established_quadrants_seen
+2026-06-17 05:21:00,20260617-052100-mine-best,mine best,mine,0,0,3,76.333,2002.333,65.94,0.0,37.55,20.09,20.333,21.333,0.0,0.0,3
+2026-06-17 05:21:00,20260617-052100-mine-best,mine best,best,3,0,3,70.333,4550.333,63.03,0.0,29.86,30.33,32.0,8.333,68.0,2001.667,4

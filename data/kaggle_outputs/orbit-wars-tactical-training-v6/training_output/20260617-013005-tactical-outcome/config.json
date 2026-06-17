@@ -1,0 +1,23 @@
+{
+  "append_from_run": [],
+  "batch_size": 2048,
+  "epochs": 12,
+  "from_run": null,
+  "init_from_model": "/kaggle/working/orbit_training/model_weights.npz",
+  "l2": 0.0005,
+  "lineup_preset": "opportunity",
+  "log_every": 2,
+  "lr": 0.04,
+  "no_progressive_history": false,
+  "no_warm_start": false,
+  "out": "/kaggle/working/training_output",
+  "progress_every": 50,
+  "ranking_top_k": 5,
+  "sample_stride": 10,
+  "seed": 20260617,
+  "train_ratio": 0.8,
+  "training_mode": "outcome",
+  "with_mine_games": 500,
+  "without_mine_games": 500,
+  "workers": 4
+}
