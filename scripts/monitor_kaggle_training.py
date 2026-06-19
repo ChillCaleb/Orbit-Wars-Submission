@@ -12,6 +12,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_KERNEL = "calebbanks/orbit-wars-tactical-training"
 RUNS_DIR = ROOT / "data" / "kaggle_runs"
+BUNDLES_DIR = ROOT / "kaggle" / "bundles"
 TERMINAL_STATES = {"COMPLETE", "ERROR", "CANCELLED"}
 
 
@@ -46,8 +47,20 @@ def kernel_status(kernel):
     return match.group(1), output
 
 
-def expected_games():
-    manifest = ROOT / "kaggle_training" / "bundle_manifest.json"
+def latest_bundle_manifest():
+    candidates = sorted(BUNDLES_DIR.glob("*/bundle_manifest.json"), key=lambda path: path.stat().st_mtime)
+    if candidates:
+        return candidates[-1]
+    legacy = ROOT / "kaggle_training" / "bundle_manifest.json"
+    return legacy if legacy.exists() else None
+
+
+def expected_games(manifest_path=None):
+    manifest = Path(manifest_path) if manifest_path else latest_bundle_manifest()
+    if manifest is None:
+        return None
+    if manifest is not None and not manifest.is_absolute():
+        manifest = ROOT / manifest
     if not manifest.exists():
         return None
     data = json.loads(manifest.read_text(encoding="utf-8"))
@@ -110,6 +123,7 @@ def main():
     parser.add_argument("--once", action="store_true", help="Check once instead of waiting for completion.")
     parser.add_argument("--timeout-hours", type=float, default=12.0)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--manifest", type=Path, default=None, help="Bundle manifest used to validate expected game count.")
     args = parser.parse_args()
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -117,7 +131,7 @@ def main():
     if not run_dir.is_absolute():
         run_dir = ROOT / run_dir
     logger = RunLogger(run_dir / "monitor.log")
-    expected = expected_games()
+    expected = expected_games(args.manifest)
     deadline = time.monotonic() + args.timeout_hours * 3600
 
     logger.write(

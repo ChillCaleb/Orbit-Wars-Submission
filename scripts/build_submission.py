@@ -26,6 +26,9 @@ SOURCE_FILES = (
 SOURCE_DIRS = (
     "agents",
 )
+SOURCE_DIR_EXCLUDES = (
+    ("agents", "imported"),
+)
 
 
 WRAPPER_TEMPLATE = '''\
@@ -90,6 +93,7 @@ def build_bundle(model_weights_path: Path, controller_weights_path: Path | None 
                 str(path.relative_to(ROOT))
                 for path in sorted(directory.rglob("*.py"))
                 if "__pycache__" not in path.parts
+                and not any(tuple(path.relative_to(ROOT).parts[: len(exclude)]) == exclude for exclude in SOURCE_DIR_EXCLUDES)
             )
 
         for relative_name in dict.fromkeys(relative_names):

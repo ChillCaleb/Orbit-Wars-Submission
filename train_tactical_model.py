@@ -2,6 +2,7 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
 import hashlib
+from itertools import combinations
 import json
 import math
 import random
@@ -104,6 +105,39 @@ WITHOUT_MINE_OPPORTUNITY_LINEUPS = (
 
 WORKER_LINEUP_CACHE = {}
 RANKING_DEFAULT_TOP_K = 5
+BASE_TRAINING_MODELS = ("1200", "smith", "1039", "best", "intruder")
+
+
+def _imported_training_models():
+    imported_root = ROOT / "agents" / "imported"
+    if not imported_root.exists():
+        return []
+    return [path.parent.name for path in sorted(imported_root.glob("*/agent.py"))]
+
+
+def available_training_models():
+    models = []
+    seen = set()
+    for name in (*BASE_TRAINING_MODELS, *_imported_training_models()):
+        if name in seen:
+            continue
+        seen.add(name)
+        models.append(name)
+    return tuple(models)
+
+
+def all_combo_lineups(category):
+    opponents = available_training_models()
+    lineups = []
+    if category == "with_mine":
+        lineups.extend(("mine", opponent) for opponent in opponents)
+        if len(opponents) >= 3:
+            lineups.extend(("mine", *combo) for combo in combinations(opponents, 3))
+    else:
+        lineups.extend(combinations(opponents, 2))
+        if len(opponents) >= 4:
+            lineups.extend(combinations(opponents, 4))
+    return tuple(tuple(lineup) for lineup in lineups)
 
 
 def starter_agent(obs, _rng=None):
@@ -739,7 +773,9 @@ def lineup_for(category, index, preset="all"):
     elif preset == "opportunity":
         choices = WITH_MINE_OPPORTUNITY_LINEUPS if category == "with_mine" else WITHOUT_MINE_OPPORTUNITY_LINEUPS
     else:
-        choices = WITH_MINE_LINEUPS if category == "with_mine" else WITHOUT_MINE_LINEUPS
+        choices = all_combo_lineups(category)
+        if not choices:
+            choices = WITH_MINE_LINEUPS if category == "with_mine" else WITHOUT_MINE_LINEUPS
     return choices[index % len(choices)]
 
 

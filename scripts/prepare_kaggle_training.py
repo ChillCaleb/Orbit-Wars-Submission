@@ -8,7 +8,7 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-OUTPUT_DIR = ROOT / "kaggle_training"
+OUTPUT_DIR = ROOT / "kaggle" / "bundles" / "training"
 SOURCE_FILES = (
     "main.py",
     "tactical_features.py",
@@ -194,6 +194,7 @@ def main():
     parser.add_argument("--seed", type=int, default=20261100)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--progress-every", type=int, default=25)
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
     args = parser.parse_args()
 
     bundle_b64, manifest = build_bundle()
@@ -212,8 +213,9 @@ def main():
         args.seed,
         args.progress_every,
     )
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    notebook_path = OUTPUT_DIR / "training.ipynb"
+    output_dir = args.output_dir if args.output_dir.is_absolute() else ROOT / args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    notebook_path = output_dir / "training.ipynb"
     notebook_path.write_text(json.dumps(notebook), encoding="utf-8")
 
     digest = hashlib.sha256(notebook_path.read_bytes()).hexdigest()
@@ -234,7 +236,7 @@ def main():
         "progress_every": args.progress_every,
         "files": manifest,
     }
-    (OUTPUT_DIR / "bundle_manifest.json").write_text(json.dumps(manifest_data, indent=2) + "\n", encoding="utf-8")
+    (output_dir / "bundle_manifest.json").write_text(json.dumps(manifest_data, indent=2) + "\n", encoding="utf-8")
     print(f"Prepared {notebook_path}")
     print(f"SHA256 {digest}")
     print("No Kaggle upload was performed.")

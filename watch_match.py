@@ -31,6 +31,19 @@ LOCAL_AGENT_ALIASES = {
     "light_intruder": "agents/light_intruder/agent_light_intruder.py",
 }
 
+
+def _discover_imported_agent_aliases():
+    imported_root = ROOT / "agents" / "imported"
+    aliases = {}
+    if not imported_root.exists():
+        return aliases
+    for agent_path in sorted(imported_root.glob("*/agent.py")):
+        aliases[agent_path.parent.name] = agent_path.relative_to(ROOT).as_posix()
+    return aliases
+
+
+LOCAL_AGENT_ALIASES.update(_discover_imported_agent_aliases())
+
 COLORS = {
     -1: "#888888",
     0: "#0072B2",

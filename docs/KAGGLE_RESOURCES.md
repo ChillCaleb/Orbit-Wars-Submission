@@ -51,7 +51,7 @@ python scripts/prepare_kaggle_training.py \
   --without-mine-games 100 \
   --workers 4
 
-kaggle kernels push -p kaggle_training
+kaggle kernels push -p kaggle/bundles/training
 ```
 
 Monitor the run:
