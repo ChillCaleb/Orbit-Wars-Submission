@@ -9,6 +9,7 @@ data/pressure_experiments/
 data/agent_comparisons/
 data/kaggle_runs/
 data/kaggle_matches/
+data/self_play_runs/
 model_weights.npz
 submission.zip
 kaggle-submit.zip
