@@ -10,6 +10,7 @@ data/agent_comparisons/
 data/kaggle_runs/
 data/kaggle_matches/
 data/self_play_runs/
+data/hull_method/
 model_weights.npz
 submission.zip
 kaggle-submit.zip
